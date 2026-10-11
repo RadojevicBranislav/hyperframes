@@ -16,6 +16,8 @@
 
 <p align="center"><b>Write HTML. Render video. Built for agents.</b></p>
 
+> **Bane editing skill:** This fork includes the [Bane vertical editing skill](.agents/skills/bane-ss-edit/SKILL.md) and its references alongside the complete HyperFrames framework. Framework source and license come from [heygen-com/hyperframes](https://github.com/heygen-com/hyperframes).
+
 <p align="center">
   <a href="https://www.hyperframes.dev/studio">Studio</a> |
   <a href="https://hyperframes.heygen.com/quickstart">Quickstart</a> |
