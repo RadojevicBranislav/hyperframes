@@ -14,7 +14,10 @@ export default defineConfig({
     "helpers/finiteMutation": "src/helpers/finiteMutation.ts",
     "helpers/sourceMutation": "src/helpers/sourceMutation.ts",
     "helpers/safePath": "src/helpers/safePath.ts",
+    "helpers/requestIdentity": "src/helpers/requestIdentity.ts",
     "helpers/hfIdPersist": "src/helpers/hfIdPersist.ts",
+    "helpers/encoderOptions": "src/helpers/encoderOptions.ts",
+    "helpers/mediaRange": "src/helpers/mediaRange.ts",
     "history/index": "src/history/index.ts",
   },
   format: ["esm"],
@@ -30,4 +33,6 @@ export default defineConfig({
   splitting: true,
   clean: true,
   dts: true,
+  // An optional dependency, so tsup would otherwise inline it.
+  external: ["sharp"],
 });

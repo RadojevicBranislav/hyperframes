@@ -1,4 +1,4 @@
-import { launchManagedBrowser } from "../browser/launch.js";
+import { launchCaptureBrowser } from "./launchCaptureBrowser.js";
 import { LottieDiscovery } from "./lottieDiscovery.js";
 import { createCaptureDownloadBudget } from "./readBoundedResponse.js";
 /**
@@ -27,9 +27,10 @@ import type {
   ExtractedHtml,
 } from "./types.js";
 import type { CaptureWatchdog } from "./captureWatchdog.js";
-import { captureBrowserArgs } from "./browserLaunchArgs.js";
+
 import type { PartialCaptureState } from "./partialCapture.js";
 import { runNavigationChecks } from "./navigationPhase.js";
+import { watchWebglStall } from "./webglStallWatch.js";
 import { runCoreExtraction } from "./coreExtractionPhase.js";
 import { runPostExtraction } from "./postExtractionPhase.js";
 
@@ -41,6 +42,7 @@ export async function captureWebsiteAttempt(
   disableWebgl: boolean,
   watchdog: CaptureWatchdog,
   state: PartialCaptureState,
+  localOrigin?: string,
 ): Promise<CaptureResult> {
   const {
     url,
@@ -56,6 +58,16 @@ export async function captureWebsiteAttempt(
     onPhase,
   } = opts;
 
+  const initialUrl = new URL(url);
+  if (localOrigin !== undefined) {
+    if (initialUrl.origin !== localOrigin) throw new Error("Local capture URL must use its server");
+  } else if (
+    !["http:", "https:"].includes(initialUrl.protocol) ||
+    initialUrl.username ||
+    initialUrl.password
+  ) {
+    throw new Error("Capture requires a public HTTP or HTTPS URL without credentials");
+  }
   const downloadByteBudget = createCaptureDownloadBudget();
   const warnings: string[] = [...state.warnings];
   state.warnings = warnings;
@@ -111,14 +123,16 @@ export async function captureWebsiteAttempt(
   progress("browser", "Launching headless Chrome...");
   const { ensureBrowser } = await import("../browser/manager.js");
   const browser = await ensureBrowser();
-  const puppeteer = await import("puppeteer-core");
-  const chromeBrowser = await launchManagedBrowser(puppeteer.default, {
-    headless: true,
+  const captureBrowser = await launchCaptureBrowser({
     executablePath: browser.executablePath,
     protocolTimeout: captureProtocolTimeoutMs(timeout, budgetMs),
-    args: captureBrowserArgs(disableWebgl, viewportWidth, viewportHeight),
+    disableWebgl,
+    width: viewportWidth,
+    height: viewportHeight,
+    localOrigin,
   });
-  watchdog.registerBrowser(chromeBrowser);
+  const chromeBrowser = captureBrowser.browser;
+  watchdog.registerBrowser(captureBrowser);
 
   let animationCatalog: CaptureResult["animationCatalog"];
   let tokens: DesignTokens = state.tokens;
@@ -140,6 +154,7 @@ export async function captureWebsiteAttempt(
     bodyChildCount: Number.POSITIVE_INFINITY,
   };
   let contentCheckTimedOut = false;
+  let stallWatch: { stop(): void } | undefined;
 
   try {
     // ═══════════════════════════════════════════════════════════════
@@ -158,6 +173,11 @@ export async function captureWebsiteAttempt(
     // Set up hooks BEFORE navigation
     await setupAnimationCapture(page1);
     const { cdp, animations: cdpAnims } = await startCdpAnimationCapture(page1);
+    if (!disableWebgl)
+      stallWatch = watchWebglStall(cdp, () => {
+        state.webglStalled = true;
+        void captureBrowser.close();
+      });
 
     // Hook WebGL to capture shader source code (GLSL)
     // Captured shaders inform Claude Code about the site's visual effects
@@ -339,7 +359,8 @@ export async function captureWebsiteAttempt(
       lastPhase,
     };
   } finally {
-    watchdog.unregisterBrowser(chromeBrowser);
-    await chromeBrowser.close();
+    stallWatch?.stop();
+    watchdog.unregisterBrowser(captureBrowser);
+    await captureBrowser.close();
   }
 }

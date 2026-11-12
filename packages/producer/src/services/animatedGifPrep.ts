@@ -1,19 +1,13 @@
 // fallow-ignore-file complexity
 import { createHash } from "node:crypto";
-import {
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  statSync,
-} from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { parseHTML } from "linkedom";
 import { parseAnimatedGifMetadata, type AnimatedGifMetadata } from "@hyperframes/core";
-import { DEFAULT_VP9_CPU_USED, runFfmpeg } from "@hyperframes/engine";
+import { DEFAULT_VP9_CPU_USED, runFfmpeg, renameWithRetry } from "@hyperframes/engine";
+import { namesAnotherNetworkRoot } from "@hyperframes/parsers/asset-resolution";
 import { isHttpUrl } from "../utils/urlDownloader.js";
+import { escapesAssetRoot } from "../utils/paths.js";
 import { encoderFailureError } from "./render/encoderInterruption.js";
 
 const PREPARED_GIF_SUBDIR = "_animated_gif";
@@ -39,6 +33,7 @@ export interface PrepareAnimatedGifInputsOptions {
   sourceAssets?: Map<string, string>;
   timeoutMs?: number;
   transcode?: (input: AnimatedGifTranscodeRequest) => Promise<void>;
+  assetRoot?: string;
 }
 
 export interface AnimatedGifTranscodeRequest {
@@ -54,7 +49,7 @@ export interface PrepareAnimatedGifInputsResult {
   preparedGifs: PreparedAnimatedGif[];
 }
 
-function splitUrlSuffix(src: string): { basePath: string; suffix: string } {
+export function splitUrlSuffix(src: string): { basePath: string; suffix: string } {
   const queryIdx = src.indexOf("?");
   const hashIdx = src.indexOf("#");
   if (queryIdx < 0 && hashIdx < 0) return { basePath: src, suffix: "" };
@@ -62,7 +57,7 @@ function splitUrlSuffix(src: string): { basePath: string; suffix: string } {
   return { basePath: src.slice(0, cutIdx), suffix: src.slice(cutIdx) };
 }
 
-function normalizeRelPath(path: string): string {
+export function normalizeRelPath(path: string): string {
   return path.replace(/\\/g, "/").replace(/^\/+/, "");
 }
 
@@ -84,9 +79,12 @@ function readLoopOverride(el: Element): boolean | null {
   return null;
 }
 
-function resolveGifSourcePath(
+export function resolveLocalImageSourcePath(
   src: string,
-  options: Pick<PrepareAnimatedGifInputsOptions, "projectDir" | "downloadDir" | "sourceAssets">,
+  options: Pick<
+    PrepareAnimatedGifInputsOptions,
+    "projectDir" | "downloadDir" | "sourceAssets" | "assetRoot"
+  >,
 ): string | null {
   const trimmed = src.trim();
   if (!trimmed || trimmed.startsWith("data:")) return null;
@@ -100,13 +98,20 @@ function resolveGifSourcePath(
   if (mapped && existsSync(mapped)) return mapped;
   if (isHttpUrl(trimmed)) return null;
 
+  const protocolRelativeUrlOnShare =
+    basePath.startsWith("/") && namesAnotherNetworkRoot(options.projectDir, basePath);
   const projectRelative = basePath.startsWith("/") ? basePath.slice(1) : basePath;
   const candidates = [
-    isAbsolute(basePath) ? basePath : resolve(options.projectDir, projectRelative),
+    ...(protocolRelativeUrlOnShare
+      ? []
+      : [isAbsolute(basePath) ? basePath : resolve(options.projectDir, projectRelative)]),
     resolve(options.downloadDir, normalizedBase),
   ];
 
-  return candidates.find((candidate) => existsSync(candidate)) ?? null;
+  const allowed = (candidate: string) =>
+    !escapesAssetRoot(candidate, options.assetRoot) ||
+    !escapesAssetRoot(candidate, options.downloadDir);
+  return candidates.find((candidate) => existsSync(candidate) && allowed(candidate)) ?? null;
 }
 
 function isUsableFile(path: string): boolean {
@@ -177,18 +182,18 @@ function resolveClipWindowSeconds(img: Element, compositionDuration: number | nu
 
 function resolvePreparedPlayback(
   metadata: AnimatedGifMetadata,
-  loop: boolean,
+  loopOverride: boolean | null,
   windowSeconds: number | null,
 ): { loopIterations: number; padSeconds: number } {
   const gifDuration = metadata.durationSeconds > 0 ? metadata.durationSeconds : null;
 
   let loopIterations = 1;
-  if (loop) {
+  if (resolveLoop(metadata, loopOverride)) {
     loopIterations =
       windowSeconds != null && gifDuration != null
         ? Math.min(MAX_LOOP_ITERATIONS, Math.max(1, Math.ceil(windowSeconds / gifDuration)))
         : 1;
-  } else if (metadata.loopCount != null && metadata.loopCount > 1) {
+  } else if (loopOverride == null && metadata.loopCount != null && metadata.loopCount > 1) {
     loopIterations = Math.min(MAX_LOOP_ITERATIONS, metadata.loopCount);
   }
 
@@ -256,7 +261,7 @@ async function runAnimatedGifTranscode(request: AnimatedGifTranscodeRequest): Pr
       failureReason: result.failureReason,
     });
   }
-  if (result.terminationReason === "deadline") {
+  if (result.terminationReason === "inactivity") {
     throw new Error(`Animated GIF transcode timed out after ${timeout}ms`);
   }
   throw (
@@ -301,7 +306,7 @@ async function ensurePreparedWebm(input: {
         throw new Error("Animated GIF transcode produced an empty output");
       }
       if (!isUsableFile(input.cachePath)) {
-        renameSync(tmpPath, input.cachePath);
+        renameWithRetry(tmpPath, input.cachePath);
       } else {
         rmSync(tmpPath, { force: true });
       }
@@ -388,16 +393,21 @@ export async function prepareAnimatedGifInputs(
     const img = images[i]!;
     const src = (img.getAttribute("src") || "").trim();
     if (!hasGifExtension(src)) continue;
-    const sourcePath = resolveGifSourcePath(src, options);
+    const sourcePath = resolveLocalImageSourcePath(src, options);
     if (!sourcePath) continue;
 
     const bytes = readFileSync(sourcePath);
     const metadata = parseAnimatedGifMetadata(bytes);
     if (!metadata?.animated) continue;
 
-    const loop = resolveLoop(metadata, readLoopOverride(img));
+    const loopOverride = readLoopOverride(img);
+    const loop = resolveLoop(metadata, loopOverride);
     const windowSeconds = resolveClipWindowSeconds(img, compositionDuration);
-    const { loopIterations, padSeconds } = resolvePreparedPlayback(metadata, loop, windowSeconds);
+    const { loopIterations, padSeconds } = resolvePreparedPlayback(
+      metadata,
+      loopOverride,
+      windowSeconds,
+    );
     const hash = computePreparedGifHash(bytes, loopIterations, padSeconds);
     const filename = `${CACHE_SCHEMA}-${hash.slice(0, 24)}.webm`;
     const cachePath = join(cacheDir, filename);

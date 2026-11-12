@@ -1,3 +1,4 @@
+import { wallSetTimeout } from "./wallClock";
 import { swallow } from "./diagnostics";
 import type { HfColorGradingTarget } from "../colorGrading";
 import type { RuntimeBridgeControlMessage, RuntimeOutboundMessage } from "./types";
@@ -33,6 +34,10 @@ type BridgeDeps = {
   onSetRuntimeData?: (channel: string, payload: unknown, requestId?: number) => void;
   onClearRuntimeData?: (channel: string, requestId?: number) => void;
   onSetDisplayScale?: (scale: number) => void;
+  onSetPreviewQuality?: (level: number) => void;
+  onSetCopiesAhead?: (on: boolean) => void;
+  onRetryPreviewCopies?: () => void;
+  onRequestPreviewFacts?: () => void;
   getCanonicalFps: () => number;
 };
 
@@ -76,6 +81,10 @@ const CONTROL_HANDLERS = new Map<string, ControlHandler>(
     "set-playback-rate": (data, deps) => deps.onSetPlaybackRate(Number(data.playbackRate ?? 1)),
     "set-idle-heartbeat": (data, deps) => deps.onSetIdleHeartbeat(Boolean(data.slow)),
     "set-display-scale": (data, deps) => deps.onSetDisplayScale?.(Number(data.scale)),
+    "set-preview-quality": (data, deps) => deps.onSetPreviewQuality?.(Number(data.level)),
+    "set-copies-ahead": (data, deps) => deps.onSetCopiesAhead?.(Boolean(data.on)),
+    "retry-preview-copies": (_d, deps) => deps.onRetryPreviewCopies?.(),
+    "request-preview-facts": (_d, deps) => deps.onRequestPreviewFacts?.(),
     "set-root-duration": (data, deps) => deps.onSetRootDuration(Number(data.durationSeconds ?? 0)),
     "set-play-range": (data, deps) =>
       deps.onSetPlayRange(
@@ -182,7 +191,7 @@ function flashElements(selectors: string[], duration: number): void {
       const els = document.querySelectorAll(selector);
       els.forEach((el) => {
         el.classList.add("__hf-flash");
-        setTimeout(() => el.classList.remove("__hf-flash"), duration);
+        wallSetTimeout(() => el.classList.remove("__hf-flash"), duration);
       });
     } catch (err) {
       // Invalid selector — skip

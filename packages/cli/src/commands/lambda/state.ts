@@ -23,7 +23,14 @@ export interface StackOutputs {
   functionName: string;
   /** Lambda memory MB used during deploy; carried so cost math doesn't have to re-derive it. */
   lambdaMemoryMb: number;
+  reservedConcurrency?: number;
+  videoFunctionName?: string;
+  videoRepository?: string;
   deployedAt: string;
+}
+
+export function videoArchitecture(stack: StackOutputs): "arm64" | undefined {
+  return stack.videoFunctionName ? "arm64" : undefined;
 }
 
 const STATE_DIR_NAME = ".hyperframes";
@@ -78,6 +85,9 @@ export function listStackNames(cwd: string = process.cwd()): string[] {
     .map((f) => f.slice(STATE_FILE_PREFIX.length, -".json".length));
 }
 
+const sameFileOnCaseInsensitiveDisk = (a: string, b: string): boolean =>
+  a.toLowerCase() === b.toLowerCase();
+
 /**
  * Read stack outputs or print a helpful error and exit. Shared between
  * `render`, `progress`, and `destroy` so the "did you run `deploy` first?"
@@ -85,14 +95,19 @@ export function listStackNames(cwd: string = process.cwd()): string[] {
  */
 export function requireStack(stackName: string, cwd: string = process.cwd()): StackOutputs {
   const stack = readStackOutputs(stackName, cwd);
+  const path = stateFilePath(stackName, cwd);
+  const deploy = `Run \`hyperframes lambda deploy${stackName === DEFAULT_STACK_NAME ? "" : ` --stack-name=${stackName}`}\``;
   if (!stack) {
     const known = listStackNames(cwd);
-    let hint = `Run \`hyperframes lambda deploy${stackName === DEFAULT_STACK_NAME ? "" : ` --stack-name=${stackName}`}\` first.`;
-    if (known.length) {
-      hint += ` Known stacks here: ${known.join(", ")}.`;
-    }
+    const hint = known.length ? ` Known stacks here: ${known.join(", ")}.` : "";
     console.error(
-      `[hyperframes lambda] no stack state for "${stackName}" at ${stateFilePath(stackName, cwd)}. ${hint}`,
+      `[hyperframes lambda] no stack state for "${stackName}" at ${path}. ${deploy} first.${hint}`,
+    );
+    failCommand();
+  }
+  if (!sameFileOnCaseInsensitiveDisk(String(stack.stackName), stackName)) {
+    console.error(
+      `[hyperframes lambda] ${path} names stack "${stack.stackName}", not "${stackName}". ${deploy} to rewrite it.`,
     );
     failCommand();
   }

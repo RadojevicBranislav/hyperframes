@@ -1,6 +1,8 @@
 import type { LintContext, HyperframeLintFinding } from "../context";
 import postcss from "postcss";
+import { styleRoot } from "../styleRoots";
 import selectorParser from "postcss-selector-parser";
+import { GLSL_SCRIPT_TYPES } from "../shaderDomains";
 import {
   HTML_BODY_CSS_WIDTH_FIRST_RE,
   HTML_BODY_CSS_HEIGHT_FIRST_RE,
@@ -12,6 +14,7 @@ import {
   truncateSnippet,
   stripJsComments,
   stripStringLiterals,
+  blankInlinedGsapLibrary,
   extractCompositionIdsFromCss,
   extractTimelineRegistryKeys,
   getInlineScriptSyntaxError,
@@ -27,6 +30,7 @@ const SCRIPT_SYNTAX_EXEMPT_TYPES = new Set([
   "application/hyperframes-slideshow+json",
   "importmap",
   "module",
+  ...GLSL_SCRIPT_TYPES,
 ]);
 
 function repeatedDescendantId(selector: string): string | null {
@@ -113,7 +117,7 @@ function digitIdsTargetedBySelectors(
   const ids = new Set<string>();
   for (const style of styles) {
     try {
-      postcss.parse(style.content).walkRules((rule) => {
+      styleRoot(style).walkRules((rule) => {
         for (const selector of rule.selectors) addUnescapedDigitIds(selector, ids);
       });
     } catch {
@@ -191,6 +195,20 @@ function selectorAliasesRuntimeHiddenStyle(selector: string): boolean {
     return false;
   }
   return unsafe;
+}
+
+function selectsOnInlineStyle(selector: string): boolean {
+  let found = false;
+  try {
+    selectorParser((root) => {
+      root.walkAttributes((node) => {
+        if (node.attribute.toLowerCase() === "style") found = true;
+      });
+    }).processSync(selector);
+  } catch {
+    return false;
+  }
+  return found;
 }
 
 const POSITION_PROPERTIES = new Set(["left", "top", "right", "bottom", "inset"]);
@@ -608,11 +626,16 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
       return [];
     }
     if (/(?:^|\s)data-no-timeline(?=[\s=/]|$)/i.test(rootTag?.attrs || "")) return [];
+    if (options.scriptsOutsideProjectUnread?.length) return [];
     const findings: HyperframeLintFinding[] = [];
+    const registered = [source, ...(options.externalScripts ?? []).map((script) => script.content)];
     if (
-      !TIMELINE_REGISTRY_INIT_PATTERN.test(source) &&
-      !TIMELINE_REGISTRY_ASSIGN_PATTERN.test(source) &&
-      !TIMELINE_REGISTRY_OBJECT_LITERAL_PATTERN.test(source)
+      !registered.some(
+        (text) =>
+          TIMELINE_REGISTRY_INIT_PATTERN.test(text) ||
+          TIMELINE_REGISTRY_ASSIGN_PATTERN.test(text) ||
+          TIMELINE_REGISTRY_OBJECT_LITERAL_PATTERN.test(text),
+      )
     ) {
       findings.push({
         code: "missing_timeline_registry",
@@ -664,7 +687,7 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
       if (!/transition/i.test(style.content)) continue;
       let root: postcss.Root;
       try {
-        root = postcss.parse(style.content);
+        root = styleRoot(style);
       } catch {
         // The CSS syntax rule reports malformed style blocks separately.
         continue;
@@ -710,11 +733,12 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
     const findings: HyperframeLintFinding[] = [];
     const reportedRepeatedIds = new Set<string>();
     const reportedHiddenStyleSelectors = new Set<string>();
+    const reportedInlineStyleSelectors = new Set<string>();
     const reportedReducedIdSelectors = new Set<string>();
     for (const style of styles) {
       let root: postcss.Root;
       try {
-        root = postcss.parse(style.content);
+        root = styleRoot(style);
       } catch (error) {
         findings.push({
           ...locate(
@@ -726,6 +750,8 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
           code: "css_parse_error",
           severity: "error",
           message: `CSS parse error: ${error instanceof Error ? error.message : "unknown"}`,
+          fixHint:
+            "Check the CSS at the reported line for an unclosed brace, quote, or comment, or a missing semicolon between declarations.",
         });
         continue;
       }
@@ -745,6 +771,23 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
             });
           }
 
+          if (!reportedInlineStyleSelectors.has(selector) && selectsOnInlineStyle(selector)) {
+            reportedInlineStyleSelectors.add(selector);
+            findings.push({
+              code: "inline_style_attribute_selector",
+              severity: "error",
+              message:
+                `Selector "${selector}" reads the inline \`style\` attribute. GSAP writes inline styles every ` +
+                "frame, and each write then restyles far more than the animated element, " +
+                "so the preview slows to a crawl.",
+              selector,
+              fixHint:
+                "Let the runtime hide hidden clips; it already hides their contents. For a state of your own, " +
+                "toggle a class or data attribute from your script and select on that.",
+              snippet: truncateSnippet(rule.toString()),
+            });
+          }
+
           if (
             !forcesOpacityZero ||
             reportedHiddenStyleSelectors.has(selector) ||
@@ -759,7 +802,8 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
             message: `Selector "${selector}" observes HyperFrames' runtime-owned hidden style and forces opacity to zero. The renderer hides each native video before copying its computed opacity to the visible replacement frame, so this rule makes both transparent.`,
             selector,
             fixHint:
-              'Restrict the guard to sub-composition hosts, for example `[data-composition-src][style*="visibility: hidden"]` and `[data-composition-file][style*="visibility: hidden"]`. Do not derive arbitrary element or media opacity from runtime-owned inline visibility.',
+              "Remove this rule; the runtime already hides a hidden clip and its contents. To fade or hide something " +
+              "yourself, animate it on the timeline, or toggle a class or data attribute and select on that.",
             snippet: truncateSnippet(rule.toString()),
           });
         }
@@ -801,9 +845,9 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   ({ scripts, locate }) => {
     const findings: HyperframeLintFinding[] = [];
     for (const script of scripts) {
-      const type = readDecodedAttr(script.raw, "type")?.trim().toLowerCase() ?? "";
-      if (readDecodedAttr(script.raw, "src") !== null || SCRIPT_SYNTAX_EXEMPT_TYPES.has(type))
-        continue;
+      const tag = `<script ${script.attrs}>`;
+      const type = readDecodedAttr(tag, "type")?.trim().toLowerCase() ?? "";
+      if (readDecodedAttr(tag, "src") !== null || SCRIPT_SYNTAX_EXEMPT_TYPES.has(type)) continue;
       const syntaxError = getInlineScriptSyntaxError(script.content);
       if (!syntaxError) continue;
       findings.push({
@@ -923,6 +967,11 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
         hint: "Use a seeded PRNG (e.g. a simple mulberry32) so renders are deterministic across frames.",
       },
       {
+        pattern: /crypto\.randomUUID\s*\(/,
+        label: "crypto.randomUUID()",
+        hint: "Use a seeded PRNG (e.g. a simple mulberry32) so renders are deterministic across frames.",
+      },
+      {
         pattern: /gsap\.utils\.random\s*\(/,
         label: "gsap.utils.random()",
         hint: "Each render worker initializes independently, so random values diverge across chunks. Use a seeded PRNG or fixed values.",
@@ -940,9 +989,9 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
     ];
 
     for (const script of scripts) {
-      const withoutComments = stripJsComments(script.content);
+      const withoutComments = stripJsComments(blankInlinedGsapLibrary(script.content));
       // Strings are content, not code. A composition that DISPLAYS source (the
-      // code-snippet blocks, /pr-to-video) carries `Math.random()` inside a string
+      // code-snippet blocks) carries `Math.random()` inside a string
       // literal it never executes, and reported itself non-deterministic with no
       // way to clear the error while still rendering the snippet.
       const executable = stripStringLiterals(withoutComments);

@@ -14,7 +14,9 @@ import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DownloadOptions } from "../cloud/download.js";
+import { execFileSync } from "node:child_process";
 import {
+  decodeTimeoutMs,
   ensureParakeetModel,
   installSherpaRuntime,
   SHERPA_RUNTIME_DIR,
@@ -90,8 +92,8 @@ describe("installSherpaRuntime", () => {
       expect(await sherpaRuntimeLoadError(dir)).toBe(
         "libonnxruntime.so: cannot open shared object",
       );
-      const run = vi.fn(async (args: string[]) =>
-        fakeRuntime(args[args.indexOf("--prefix") + 1]!, LOADS),
+      const run = vi.fn(async (_args: string[], _signal?: AbortSignal, cwd?: string) =>
+        fakeRuntime(cwd!, LOADS),
       );
 
       expect(await installSherpaRuntime({ run, dir })).toEqual({
@@ -123,8 +125,8 @@ describe("installSherpaRuntime", () => {
   it("fails with the loader's error when the reinstalled runtime still does not load", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hf-sherpa-runtime-"));
     try {
-      const run = vi.fn(async (args: string[]) =>
-        fakeRuntime(args[args.indexOf("--prefix") + 1]!, BROKEN),
+      const run = vi.fn(async (_args: string[], _signal?: AbortSignal, cwd?: string) =>
+        fakeRuntime(cwd!, BROKEN),
       );
       await expect(installSherpaRuntime({ run, dir })).rejects.toThrow(
         "The sherpa-onnx runtime was reinstalled but still does not load (libonnxruntime.so: cannot open shared object). Use --engine whisper for now.",
@@ -469,4 +471,17 @@ describe("sherpaUnsupportedReason", () => {
       /this system is linux-arm/,
     );
   });
+});
+
+describe("decodeTimeoutMs", () => {
+  // 1851.245125 s of audio once gave 3702490.25, which execFile refused as out of range.
+  it.each([1851.245125, 10_000_000])(
+    "gives execFile a timeout it accepts for %s s of audio",
+    (seconds) => {
+      const timeout = decodeTimeoutMs(seconds);
+      expect(Number.isInteger(timeout)).toBe(true);
+      expect(timeout).toBeGreaterThanOrEqual(Math.min(seconds * 2000, 2 ** 31 - 1));
+      expect(() => execFileSync(process.execPath, ["-e", ""], { timeout })).not.toThrow();
+    },
+  );
 });

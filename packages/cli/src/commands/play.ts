@@ -1,5 +1,5 @@
-import { setCommandExitCode } from "../utils/commandResult.js";
-import { defineCommand } from "citty";
+import { failUsage, setCommandExitCode } from "../utils/commandResult.js";
+import { defineCommand } from "../utils/defineCommand.js";
 import type { Example } from "./_examples.js";
 import { existsSync, readFileSync } from "node:fs";
 
@@ -21,10 +21,12 @@ export const examples: Example[] = [
 import { resolve } from "node:path";
 import type { Hono } from "hono";
 import { requestSubPath } from "@hyperframes/studio-server";
-import * as clack from "@clack/prompts";
+import * as clack from "../ui/prompts.js";
 import { c } from "../ui/colors.js";
 import { resolveProject, type ProjectDir } from "../utils/project.js";
 import { resolveAutoProxy } from "../utils/projectConfig.js";
+import { normalizeErrorMessage } from "../utils/errorMessage.js";
+import { parsePort } from "../utils/port.js";
 import {
   openBrowser,
   parseRemoteDebuggingPort,
@@ -40,6 +42,7 @@ import {
   revalidatedResponse,
   assetContentType,
 } from "../utils/compositionServer.js";
+import { isPrivateCompositionFile } from "../utils/privateProjectFile.js";
 import {
   resolveProxy,
   ProxyCapacityError,
@@ -84,14 +87,19 @@ export default defineCommand({
     },
   },
   async run({ args }) {
+    let startPort: number;
+    try {
+      startPort = parsePort(args.port ?? "3003");
+    } catch (error) {
+      clack.log.error(normalizeErrorMessage(error));
+      failUsage();
+    }
     const project = resolveProject(args.dir);
-    const startPort = parseInt(args.port ?? "3003", 10);
 
     // Validation: --user-data-dir requires --browser-path
     if (args["user-data-dir"] && !args["browser-path"]) {
       clack.log.error("--user-data-dir requires --browser-path");
-      setCommandExitCode(1);
-      return;
+      failUsage();
     }
     // Validation: --remote-debugging-port deps
     const depsError = validateRemoteDebuggingPortDeps({
@@ -101,8 +109,7 @@ export default defineCommand({
     });
     if (depsError) {
       clack.log.error(depsError);
-      setCommandExitCode(1);
-      return;
+      failUsage();
     }
     // Parse --remote-debugging-port before any server setup so an invalid value
     // exits cleanly instead of leaving an orphan listening socket behind.
@@ -113,8 +120,7 @@ export default defineCommand({
       );
     } catch (err) {
       clack.log.error((err as Error).message);
-      setCommandExitCode(1);
-      return;
+      failUsage();
     }
 
     // Resolve runtime path — same logic as studioServer.ts
@@ -225,7 +231,9 @@ export async function registerCompositionRoute(
     // an in-project symlink to an external target nor a sibling dir whose name
     // shares the project-dir prefix (e.g. `<dir>-evil`) can escape.
     if (!isSafePath(project.dir, filePath)) return ctx.text("Forbidden", 403);
-    if (!existsSync(filePath)) return ctx.text("Not found", 404);
+    if (isPrivateCompositionFile(project.dir, filePath) || !existsSync(filePath)) {
+      return ctx.text("Not found", 404);
+    }
 
     // HTML gets the runtime + codec-map injected; other assets pass through.
     if (filePath.endsWith(".html")) {
@@ -238,10 +246,11 @@ export async function registerCompositionRoute(
 
     const contentType = assetContentType(filePath);
     // Edited text is caught by a content hash; an mtime tag can repeat for a same-size rewrite.
+    const mediaType = contentType.split(";")[0]!.trim();
     const isText =
-      contentType.startsWith("text/") ||
-      contentType === "application/json" ||
-      contentType === "image/svg+xml";
+      mediaType.startsWith("text/") ||
+      mediaType === "application/json" ||
+      mediaType === "image/svg+xml";
     if (isText && !ctx.req.header("Range")) {
       return revalidatedResponse(
         readFileSync(filePath, "utf-8"),

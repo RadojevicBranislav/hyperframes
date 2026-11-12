@@ -13,8 +13,9 @@ import { decodedUrlPath } from "@hyperframes/parsers/asset-paths";
 
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, readFileSync } from "fs";
-import { join, dirname, resolve, basename, relative } from "path";
+import { join, dirname, resolve, basename, relative, sep } from "path";
 import { parseHTML } from "linkedom";
+import { bundledScript } from "./bundledScripts.js";
 import {
   COMPOSITION_SOURCE_URL,
   compileTimingAttrs,
@@ -28,6 +29,7 @@ import {
   readMediaStart,
   redactTelemetryString,
   resolveNaturalMediaTimelineDurationFromValues,
+  rewriteAssetPath,
   rewriteAssetPaths,
   rewriteCssAssetUrls,
   rewriteInlineStyleAssetUrls,
@@ -36,12 +38,14 @@ import {
   type UnresolvedElement,
 } from "@hyperframes/core";
 import { MAX_AUDIO_GAIN } from "@hyperframes/core/audio-gain";
-import { gsapCdnDist } from "@hyperframes/core/gsap-cdn";
+import { readPlaybackRate } from "@hyperframes/parsers/media-duration";
+import { resolveRateSpec } from "@hyperframes/core/speed-ramp";
+import { gsapCdnDist, normalizeGsapBaseUrl } from "@hyperframes/core/gsap-cdn";
 import {
   assignBundledRuntimeCompositionIds,
   assignMediaRenderIds,
   type BundledHostCompositionIdentity,
-  buildVariablesByCompScript,
+  emitVariablesByCompScript,
   inlineSubCompositions as inlineSubCompositionsShared,
   ensureExternalLinkTag,
   ensureExternalScriptTag,
@@ -52,7 +56,10 @@ import {
   emitRootCompositionVariableStyles,
   readDeclaredDefaults,
   parseHostVariableValues,
+  boundMediaSrc,
   headStyleRuns,
+  isAlwaysAppliedStyle,
+  dedupeFontFaceRules,
   inlineScriptRuns,
   parsesAsScript,
   styleElementsFor,
@@ -65,11 +72,15 @@ import {
 } from "@hyperframes/parsers/sub-composition-validity";
 import {
   isUnresolvedAssetPlaceholder,
+  namesAnotherNetworkRoot,
   readProjectFile,
+  readTextFile,
+  resolveCompositionSrc,
 } from "@hyperframes/parsers/asset-resolution";
+import { isPrivateFileUnder, isVcsOrSecretPath } from "@hyperframes/core/safe-path";
 import { extractMediaMetadata, extractAudioMetadata } from "../utils/ffprobe.js";
-import { isPathInside, toExternalAssetKey } from "../utils/paths.js";
-import { collectRenderMedia } from "./renderMediaCollector.js";
+import { escapesAssetRoot, isPathInside, toExternalAssetKey } from "../utils/paths.js";
+import { collectHiddenVideoIds, collectRenderMedia } from "./renderMediaCollector.js";
 import {
   type VideoElement,
   type ImageElement,
@@ -95,6 +106,7 @@ import {
   normalizeSystemFontPrimaryFamilies,
 } from "@hyperframes/core/fonts/embed";
 import { prepareAnimatedGifInputs } from "./animatedGifPrep.js";
+import { prepareHeifImageInputs } from "./heifImagePrep.js";
 import { createStudioPositionSeekReapplyScript } from "@hyperframes/studio-server/manual-edits-render-script";
 import { getPositionEditsRenderScript } from "@hyperframes/core/runtime/position-edits-render";
 import { defaultLogger, type ProducerLogger } from "../logger.js";
@@ -102,7 +114,7 @@ import { assertAssetMediaTypeProfile } from "./assetMediaType.js";
 import { withMediaProbeSlot } from "../utils/mediaProbeConcurrency.js";
 
 function logRemoteDownloadTelemetry(event: UrlDownloadTelemetry): void {
-  defaultLogger.info("[Compiler] Remote asset download integrity", { ...event });
+  defaultLogger.debug("[Compiler] Remote asset download integrity", { ...event });
 }
 
 export interface CompiledComposition {
@@ -111,6 +123,8 @@ export interface CompiledComposition {
   videos: VideoElement[];
   audios: AudioElement[];
   images: ImageElement[];
+  droppedMediaIds: Set<string>;
+  gradedCanvas: boolean;
   masterFxChain?: string;
   unresolvedCompositions: UnresolvedElement[];
   /** Assets that resolve outside projectDir. Keys are the path used in HTML, values are absolute filesystem paths. */
@@ -122,8 +136,6 @@ export interface CompiledComposition {
   hasShaderTransitions: boolean;
   /** Author HTML/CSS/scripts use a CSS 3D rendering context (pre-CDN-inline scan). */
   usesThreeDTransforms: boolean;
-  /** Author HTML/CSS use mix-blend-mode (pre-CDN-inline scan). */
-  usesMixBlendMode: boolean;
   /** Ancestors of the composition root carry a background-image (gradient/url). */
   hasAncestorBackgroundImage: boolean;
 }
@@ -206,6 +218,29 @@ class EmptyCompositionError extends Error {
   }
 }
 
+/** The html with each data-composition-src as the project-relative path it names (%xx decoded, no leading /). */
+function normalizeCompositionSrcs(html: string, projectDir: string): string {
+  return html.replace(/(\bdata-composition-src=)(["'])([^"']*)\2/g, (whole, name, quote, value) => {
+    if (!value.includes("%") && !value.startsWith("/")) return whole;
+    const file = resolveCompositionSrc(projectDir, value);
+    if (file === null) return whole;
+    return `${name}${quote}${relative(projectDir, file).split(sep).join("/")}${quote}`;
+  });
+}
+
+function resolveCompositionFile(
+  projectDir: string,
+  src: string,
+  assetRoot: string | undefined,
+): string | null {
+  const file = resolveCompositionSrc(projectDir, src);
+  return file === null || escapesAssetRoot(file, assetRoot) ? null : file;
+}
+
+// Git metadata and env files are never inlined into a render, as the preview bundler refuses them.
+const isPrivateCompositionFile = (projectDir: string, filePath: string): boolean =>
+  isPrivateFileUnder(projectDir, filePath, isVcsOrSecretPath);
+
 /**
  * Recursively walk every `data-composition-src` reference reachable from
  * `html` (including nested sub-compositions) and verify each resolves to a
@@ -224,6 +259,7 @@ class EmptyCompositionError extends Error {
 function assertSubCompositionsUsable(
   html: string,
   projectDir: string,
+  assetRoot: string | undefined,
   visited: Set<string> = new Set(),
 ): void {
   const { document } = parseHTML(html);
@@ -235,7 +271,15 @@ function assertSubCompositionsUsable(
     if (!srcPath) continue;
     if (isUnresolvedAssetPlaceholder(srcPath)) continue; // __UPPER__ placeholder or unresolved templating token — not a real reference (shared with lint via @hyperframes/parsers)
 
-    const filePath = resolve(projectDir, srcPath);
+    const filePath = resolveCompositionFile(projectDir, srcPath, assetRoot);
+    if (filePath === null) {
+      problems.push({ srcPath, detail: "it is outside the project folder" });
+      continue;
+    }
+    if (isPrivateCompositionFile(projectDir, filePath)) {
+      problems.push({ srcPath, detail: "it is git metadata or an env file" });
+      continue;
+    }
     // Circular reference guard. parseSubCompositions (below) silently
     // `continue`s on a repeat visit with no reporting at all — mirror that
     // silence here rather than pretend it surfaces an error somewhere else.
@@ -274,7 +318,7 @@ function assertSubCompositionsUsable(
     const nestedVisited = new Set(visited);
     nestedVisited.add(filePath);
     try {
-      assertSubCompositionsUsable(fileHtml, projectDir, nestedVisited);
+      assertSubCompositionsUsable(fileHtml, projectDir, assetRoot, nestedVisited);
     } catch (err) {
       if (err instanceof EmptyCompositionError) {
         problems.push(...err.problems);
@@ -289,7 +333,11 @@ function assertSubCompositionsUsable(
   }
 }
 
-export type RenderModeHintCode = "iframe" | "requestAnimationFrame" | "htmlInCanvas";
+export type RenderModeHintCode =
+  | "iframe"
+  | "requestAnimationFrame"
+  | "htmlInCanvas"
+  | "captureMotionBlur";
 
 export interface RenderModeHint {
   code: RenderModeHintCode;
@@ -319,7 +367,15 @@ function stripCompilerMountBootstrap(source: string): string {
   );
 }
 
-export function detectRenderModeHints(html: string): RenderModeHints {
+/** The composition the runtime reads data-motion-blur from: `data-root="true"`, else the first. */
+function runtimeRoot(document: ParentNode): Element | null {
+  return (
+    document.querySelector('[data-composition-id][data-root="true"]') ??
+    document.querySelector("[data-composition-id]")
+  );
+}
+
+export function detectRenderModeHints(html: string, pageMotionBlur?: "off"): RenderModeHints {
   const reasons: RenderModeHint[] = [];
   const { document } = parseHTML(html);
 
@@ -328,6 +384,16 @@ export function detectRenderModeHints(html: string): RenderModeHints {
       code: "htmlInCanvas",
       message:
         "Detected html-in-canvas API (layoutsubtree canvas). Chrome does not support concurrent drawElementImage across multiple workers; render is pinned to a single worker.",
+    });
+  } else if (
+    pageMotionBlur !== "off" &&
+    runtimeRoot(document)?.getAttribute("data-motion-blur") === "on"
+  ) {
+    // Not pinned to one worker: k3-promo measured identical across 1 and 4 workers, 2× faster.
+    reasons.push({
+      code: "captureMotionBlur",
+      message:
+        'Detected capture motion blur (data-motion-blur="on"), which draws each frame with html-in-canvas; routed through screenshot capture mode.',
     });
   }
 
@@ -381,12 +447,6 @@ const THREE_D_CONTEXT_PATTERN =
 
 export function detectThreeDTransformUsage(html: string): boolean {
   return THREE_D_CONTEXT_PATTERN.test(html);
-}
-
-const MIX_BLEND_MODE_PATTERN = /mix-blend-mode\s*:/i;
-
-function detectMixBlendModeUsage(html: string): boolean {
-  return MIX_BLEND_MODE_PATTERN.test(html);
 }
 
 /** A background declaration whose value paints an image (gradient or url). */
@@ -463,6 +523,11 @@ export function detectShaderTransitionUsage(html: string): boolean {
   return false;
 }
 
+type SourceProbe = { profile: MediaProbeProfile; fileDuration: number | null } | { error: unknown };
+
+/** One probe per unique source for a whole compile, whatever number of elements point at it. */
+type SourceProbes = Map<string, Promise<SourceProbe>>;
+
 async function resolveMediaDuration(
   src: string,
   mediaStart: number,
@@ -472,13 +537,17 @@ async function resolveMediaDuration(
   tagName: string,
   elementIdentity: string,
   log?: ProducerLogger,
+  urlByAbsentLocalPath?: ReadonlyMap<string, string>,
+  probes?: SourceProbes,
+  assetRoot?: string,
 ): Promise<{ duration: number | null; resolvedPath: string }> {
   let filePath = src;
 
   if (isHttpUrl(src)) {
-    if (!existsSync(downloadDir)) mkdirSync(downloadDir, { recursive: true });
+    const remoteDir = join(downloadDir, REMOTE_MEDIA_SUBDIR);
+    if (!existsSync(remoteDir)) mkdirSync(remoteDir, { recursive: true });
     try {
-      filePath = await downloadToTemp(src, downloadDir, undefined, undefined, undefined, {
+      filePath = await downloadToTemp(src, remoteDir, undefined, undefined, undefined, {
         onTelemetry: logRemoteDownloadTelemetry,
       });
     } catch {
@@ -489,9 +558,15 @@ async function resolveMediaDuration(
   } else {
     filePath = decodedUrlPath(src);
     if (!filePath.startsWith("/")) filePath = join(baseDir, filePath);
+    if (escapesAssetRoot(filePath, assetRoot)) return { duration: null, resolvedPath: filePath };
+    // ffprobe reads only the header of a remote source, so it is probed in place.
+    filePath = urlByAbsentLocalPath?.get(filePath) ?? filePath;
+    if (!isHttpUrl(filePath) && namesAnotherNetworkRoot(baseDir, filePath)) {
+      return { duration: null, resolvedPath: filePath };
+    }
   }
 
-  if (!existsSync(filePath)) {
+  if (!isHttpUrl(filePath) && !existsSync(filePath)) {
     return { duration: null, resolvedPath: filePath };
   }
 
@@ -520,64 +595,62 @@ async function resolveMediaDuration(
     return wrapped;
   };
 
-  return withMediaProbeSlot(async () => {
-    let profile: MediaProbeProfile;
-    try {
-      // Payload sniff (STUDIO-5433): if an authoring bug hands us a text
-      // payload (e.g. an unresolved nested-composition preview URL), fail with
-      // a typed NotMediaPayloadError instead of letting ffprobe emit an opaque
-      // `[mov,mp4,...] moov atom not found` that routes as a codec bug.
-      // Deliberately inside this try: the audio/video split below is the
-      // contract, so a bad audio src must still degrade to duration 0 rather
-      // than take down the whole render.
-      await assertMediaPayload(filePath, elementIdentity);
-      profile = await probeMediaProfile(filePath);
-    } catch (error) {
-      // Preserve the historical split: invalid video sources surface their
-      // probe failure, while invalid/unreadable audio sources resolve to zero
-      // duration and are excluded by the compiler.
-      if (tagName !== "video") {
-        if (error instanceof NotMediaPayloadError) {
-          // Dropping it silently is what let STUDIO-5433 resurface downstream
-          // as `prepare/ffmpeg_failed` with owner "system".
-          log?.warn(
-            `[compile] Audio "${elementIdentity}" (${src}) is a text document, not a media ` +
-              "file, so the element is dropped from the render. Point it at a rendered media file.",
-          );
+  const probe = () =>
+    withMediaProbeSlot(async (): Promise<SourceProbe> => {
+      try {
+        // Payload sniff (STUDIO-5433): if an authoring bug hands us a text
+        // payload (e.g. an unresolved nested-composition preview URL), fail with
+        // a typed NotMediaPayloadError instead of letting ffprobe emit an opaque
+        // `[mov,mp4,...] moov atom not found` that routes as a codec bug.
+        await assertMediaPayload(filePath, elementIdentity);
+        const profile = await probeMediaProfile(filePath);
+        if (tagName === "video") {
+          return { profile, fileDuration: (await extractMediaMetadata(filePath)).durationSeconds };
         }
-        return { duration: null, resolvedPath: filePath };
-      }
-      throw withSrcContext(error);
-    }
-    assertAssetMediaTypeProfile(tagName === "video" ? "video" : "audio", profile, elementIdentity);
-
-    let metadata: { durationSeconds: number };
-    if (tagName === "video") {
-      try {
-        metadata = await extractMediaMetadata(filePath);
+        try {
+          return { profile, fileDuration: (await extractAudioMetadata(filePath)).durationSeconds };
+        } catch {
+          // Source file has no audio stream (e.g. a silent video used as an audio src).
+          // Duration 0 excludes the element from the composition, as missing files do.
+          return { profile, fileDuration: null };
+        }
       } catch (error) {
-        throw withSrcContext(error);
+        return { error };
       }
-    } else {
-      try {
-        metadata = await extractAudioMetadata(filePath);
-      } catch {
-        // Source file has no audio stream (e.g. a silent video used as an audio src).
-        // Return duration 0 so the element is excluded from the composition gracefully,
-        // matching how missing files and failed downloads are already handled above.
-        return { duration: null, resolvedPath: filePath };
+    });
+  const key = `${tagName}\0${filePath}`;
+  let probed = probes?.get(key);
+  if (!probed) {
+    probed = probe();
+    probes?.set(key, probed);
+  }
+  const outcome = await probed;
+  if ("error" in outcome) {
+    // Invalid video sources surface their probe failure; invalid or unreadable
+    // audio sources resolve to zero duration and are excluded by the compiler.
+    if (tagName !== "video") {
+      if (outcome.error instanceof NotMediaPayloadError) {
+        log?.warn(
+          `[compile] Audio "${elementIdentity}" (${src}) is a text document, not a media ` +
+            "file, so the element is dropped from the render. Point it at a rendered media file.",
+        );
       }
+      return { duration: null, resolvedPath: filePath };
     }
-
-    const fileDuration = metadata.durationSeconds;
-    const duration = resolveNaturalMediaTimelineDurationFromValues(
-      fileDuration,
-      mediaStart,
-      playbackRate,
-    );
-
-    return { duration, resolvedPath: filePath };
-  });
+    throw withSrcContext(outcome.error);
+  }
+  assertAssetMediaTypeProfile(
+    tagName === "video" ? "video" : "audio",
+    outcome.profile,
+    elementIdentity,
+  );
+  if (outcome.fileDuration === null) return { duration: null, resolvedPath: filePath };
+  const duration = resolveNaturalMediaTimelineDurationFromValues(
+    outcome.fileDuration,
+    mediaStart,
+    playbackRate,
+  );
+  return { duration, resolvedPath: filePath };
 }
 
 /**
@@ -606,6 +679,9 @@ async function compileHtmlFile(
   baseDir: string,
   downloadDir: string,
   log?: ProducerLogger,
+  urlByAbsentLocalPath?: ReadonlyMap<string, string>,
+  probes?: SourceProbes,
+  assetRoot?: string,
 ): Promise<{ html: string; unresolvedCompositions: UnresolvedElement[] }> {
   const { html: staticCompiled, unresolved } = compileTimingAttrs(html);
 
@@ -627,6 +703,9 @@ async function compileHtmlFile(
         el.tagName,
         el.id,
         log,
+        urlByAbsentLocalPath,
+        probes,
+        assetRoot,
       ).then(({ duration }) => ({ id: el.id, duration })),
     ),
   );
@@ -641,9 +720,10 @@ async function compileHtmlFile(
   // Phase 2: Bound authored audio to playable source (parallel ffprobe).
   // Explicit video slots may outlive their source and hold the final frame.
   const preResolved = extractResolvedMedia(compiledHtml);
+  const hiddenVideoIds = collectHiddenVideoIds(compiledHtml);
   const clampResults = await Promise.all(
     preResolved
-      .filter((el) => !!el.src && !el.loop)
+      .filter((el) => !!el.src && !el.loop && !hiddenVideoIds.has(el.id))
       .map(async (el) => {
         const { duration: maxDuration } = await resolveMediaDuration(
           el.src!,
@@ -654,6 +734,9 @@ async function compileHtmlFile(
           el.tagName,
           el.id,
           log,
+          undefined,
+          probes,
+          assetRoot,
         );
         return { id: el.id, tagName: el.tagName, duration: el.duration, maxDuration, src: el.src! };
       }),
@@ -721,6 +804,9 @@ async function parseSubCompositions(
   projectDir: string,
   downloadDir: string,
   visited: Set<string> = new Set(),
+  urlByAbsentLocalPath?: ReadonlyMap<string, string>,
+  probes?: SourceProbes,
+  assetRoot?: string,
 ): Promise<{ subCompositions: Map<string, string> }> {
   const subCompositions = new Map<string, string>();
 
@@ -739,7 +825,8 @@ async function parseSubCompositions(
     const srcPath = el.getAttribute("data-composition-src");
     if (!srcPath) continue;
 
-    const filePath = resolve(projectDir, srcPath);
+    const filePath = resolveCompositionFile(projectDir, srcPath, assetRoot);
+    if (filePath === null || isPrivateCompositionFile(projectDir, filePath)) continue;
 
     // Circular reference guard
     if (visited.has(filePath)) {
@@ -751,7 +838,7 @@ async function parseSubCompositions(
       continue;
     }
 
-    const rawSubHtml = read.text;
+    const rawSubHtml = normalizeCompositionSrcs(read.text, projectDir);
     const nestedVisited = new Set(visited);
     nestedVisited.add(filePath);
 
@@ -762,9 +849,13 @@ async function parseSubCompositions(
   const results = await Promise.all(
     workItems.map(async (item) => {
       const { html: compiledSub } = await compileHtmlFile(
-        item.rawSubHtml,
+        rewriteUnresolvableGsapToCdn(item.rawSubHtml, projectDir, item.srcPath),
         dirname(item.filePath),
         downloadDir,
+        undefined,
+        urlByAbsentLocalPath,
+        probes,
+        assetRoot,
       );
 
       const nested = await parseSubCompositions(
@@ -772,6 +863,9 @@ async function parseSubCompositions(
         projectDir,
         downloadDir,
         item.nestedVisited,
+        urlByAbsentLocalPath,
+        probes,
+        assetRoot,
       );
 
       return {
@@ -911,6 +1005,12 @@ function coalesceHeadStylesAndBodyScripts(html: string): string {
   const body = document.querySelector("body");
   if (!head && !body) return html;
 
+  const liveStyles = [...document.querySelectorAll("style")].filter(isAlwaysAppliedStyle);
+  const dedupedStyles = dedupeFontFaceRules(liveStyles.map((el) => el.textContent || ""));
+  liveStyles.forEach((el, i) => {
+    el.textContent = dedupedStyles[i] ?? "";
+  });
+
   const styleEls = head ? Array.from(head.querySelectorAll("style")) : [];
   const importRe = /@import\s+url\([^)]*\)\s*;|@import\s+["'][^"']+["']\s*;/gi;
   for (const run of styleEls.length > 1 ? headStyleRuns(styleEls) : []) {
@@ -972,7 +1072,8 @@ function inlineSubCompositions(
   html: string,
   subCompositions: Map<string, string>,
   projectDir: string,
-  variableOverrides: Record<string, unknown> = {},
+  variableOverrides: Record<string, unknown>,
+  assetRoot: string | undefined,
 ): string {
   const { document } = parseHTML(html);
   const head = document.querySelector("head");
@@ -1021,8 +1122,14 @@ function inlineSubCompositions(
       resolveHtml: (srcPath: string) => {
         let compHtml = subCompositions.get(srcPath) || null;
         if (!compHtml) {
-          const read = readProjectFile(resolve(projectDir, srcPath));
-          if (read.kind === "file") compHtml = read.text;
+          const filePath = resolveCompositionFile(projectDir, srcPath, assetRoot);
+          const read =
+            filePath && !isPrivateCompositionFile(projectDir, filePath)
+              ? readProjectFile(filePath)
+              : null;
+          if (read?.kind === "file") {
+            compHtml = rewriteUnresolvableGsapToCdn(read.text, projectDir, srcPath);
+          }
         }
         return compHtml;
       },
@@ -1094,17 +1201,11 @@ function inlineSubCompositions(
     }
   }
 
-  // Append collected inline scripts to <body>. The per-instance variables
-  // table MUST be written before the sub-comp scripts run — their scoped
-  // getVariables() reads window.__hfVariablesByComp[compId]. htmlBundler
-  // (preview/snapshot) prepends this; the render path emitted only the CSS
-  // custom properties (below) and dropped the JS table, so getVariables()
-  // returned {} during render and parametrized sub-comps shipped blank/default
-  // text (issue #2064). Same shared builder as the bundler so they stay in
-  // lockstep.
-  const variablesByCompScript = buildVariablesByCompScript(result.variablesByComp);
+  // The per-instance variables table must exist before the sub-comp scripts run (their scoped getVariables() reads
+  // it); the render path once dropped it (issue #2064). Same shared emitter as the bundler so they stay in lockstep.
+  emitVariablesByCompScript(document as unknown as Document, result.variablesByComp);
   if (body) {
-    let pending = variablesByCompScript ? [variablesByCompScript] : [];
+    let pending: string[] = [];
     const flushInline = () => {
       if (!pending.length) return;
       const joined = pending.join("\n;\n");
@@ -1242,12 +1343,18 @@ export async function inlineExternalScripts(html: string): Promise<string> {
 
   const downloads = await Promise.allSettled(
     externalScripts.map(async ({ el, src }) => {
+      const integrity = el.getAttribute("integrity") || "";
+      // The host's own copy needs no network; one that fails the tag's integrity metadata is not used.
+      const bundled = bundledScript(src);
+      if (bundled && matchesScriptIntegrity(bundled, integrity)) {
+        return { src, text: new TextDecoder().decode(bundled) };
+      }
       const response = await fetch(src, {
         signal: AbortSignal.timeout(15_000),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status} for ${src}`);
       const bytes = new Uint8Array(await response.arrayBuffer());
-      if (!matchesScriptIntegrity(bytes, el.getAttribute("integrity") || "")) {
+      if (!matchesScriptIntegrity(bytes, integrity)) {
         throw new ScriptIntegrityError(`Subresource integrity mismatch for ${src}`);
       }
       return { src, text: new TextDecoder().decode(bytes) };
@@ -1269,7 +1376,7 @@ export async function inlineExternalScripts(html: string): Promise<string> {
       }
       inlineScript.textContent = `/* inlined: ${src} */\n${safeText}\n//# sourceURL=${new URL(src).href}\n`;
       el.replaceWith(inlineScript);
-      defaultLogger.info(`[Compiler] Inlined CDN script: ${src}`);
+      defaultLogger.debug(`[Compiler] Inlined CDN script: ${src}`);
     } else {
       // A verified mismatch must never fall back to an executable external tag:
       // browser support for integrity metadata (including casing) can differ.
@@ -1352,7 +1459,7 @@ export function collectExternalAssets(
   }
 
   if (externalAssets.size > 0) {
-    defaultLogger.info(
+    defaultLogger.debug(
       `[Compiler] Found ${externalAssets.size} asset(s) outside project directory, will copy to render output`,
     );
   }
@@ -1436,7 +1543,7 @@ async function downloadAndRewriteUrls(
     if (extraRewrite) result = extraRewrite(result, url, relPath);
   }
 
-  defaultLogger.info(`[Compiler] ${logLabel} ${urlToLocal.size} to ${REMOTE_MEDIA_SUBDIR}/`);
+  defaultLogger.debug(`[Compiler] ${logLabel} ${urlToLocal.size} to ${REMOTE_MEDIA_SUBDIR}/`);
   return { html: result, remoteMediaAssets };
 }
 
@@ -1691,13 +1798,39 @@ async function inlineExternalFontStylesheets(html: string): Promise<string> {
     const identity = safeDownloadUrlIdentity(href);
     const inlineStyle = `<style>/* Inlined external font stylesheet */\n${fontFaceBlocks.join("\n")}\n</style>`;
     result = result.replace(fullMatch, inlineStyle);
-    defaultLogger.info("[Compiler] Inlined external @font-face rule(s)", {
+    defaultLogger.debug("[Compiler] Inlined external @font-face rule(s)", {
       count: fontFaceBlocks.length,
       urlFingerprint: identity.urlFingerprint,
       host: identity.host,
     });
   }
   return result;
+}
+
+// Families a linked project stylesheet declares with an @font-face file the project ships.
+function projectStylesheetFontFamilies(html: string, projectDir: string): string[] {
+  const families: string[] = [];
+  for (const [tag] of html.matchAll(/<link\b[^>]*\brel=["']stylesheet["'][^>]*>/gi)) {
+    const href = /\bhref=["']([^"']+)["']/i.exec(tag)?.[1];
+    if (!href || /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(href)) continue;
+    const sheet = resolve(projectDir, decodedUrlPath(href).replace(/^(?:\.?\/)+/, ""));
+    if (!isPathInside(sheet, projectDir) || !existsSync(sheet)) continue;
+    for (const face of extractFontFaceBlocks(readFileSync(sheet, "utf8"))) {
+      const family = /font-family\s*:\s*([^;}]+)/i
+        .exec(face)?.[1]
+        ?.trim()
+        .replace(/^['"]|['"]$/g, "");
+      const shipsFile = [...face.matchAll(LOCAL_FONTFACE_URL_RE)].some(([, url = ""]) => {
+        const path = decodedUrlPath(url);
+        const file = path.startsWith("/")
+          ? resolve(projectDir, `.${path}`)
+          : resolve(dirname(sheet), path);
+        return isPathInside(file, projectDir) && existsSync(file);
+      });
+      if (family && shipsFile) families.push(family);
+    }
+  }
+  return families;
 }
 
 /**
@@ -1744,16 +1877,17 @@ export async function localizeRemoteFontFaces(
   html: string,
   downloadDir: string,
 ): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
-  // Phase 1: Inline @font-face rules from external <link rel="stylesheet"> tags.
-  const processed = await inlineExternalFontStylesheets(html);
+  return localizeFontFaceUrls(await inlineExternalFontStylesheets(html), downloadDir);
+}
 
-  // Phase 2: Download font file URLs from all @font-face blocks (both
-  // pre-existing inline blocks and the ones just inlined from external sheets).
-  const urlSet = collectFontFaceUrls(processed);
-
+/** Download the remote font files of the page's inline @font-face rules and point the rules at them. */
+function localizeFontFaceUrls(
+  html: string,
+  downloadDir: string,
+): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
   return downloadAndRewriteUrls(
-    urlSet,
-    processed,
+    collectFontFaceUrls(html),
+    html,
     join(downloadDir, REMOTE_MEDIA_SUBDIR),
     "Remote font download failed",
     "Localized remote font face(s)",
@@ -1800,7 +1934,11 @@ async function readLocalFont(absPath: string): Promise<LocalFontRead> {
 }
 
 // fallow-ignore-next-line complexity
-async function embedLocalFontFaces(html: string, projectDir: string): Promise<string> {
+async function embedLocalFontFaces(
+  html: string,
+  projectDir: string,
+  assetRoot: string | undefined,
+): Promise<string> {
   const { fontToDataUri: toDataUri } = await import("@hyperframes/core/fonts/embed");
   const styleBlockRe = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
   const fontFaceRe = /@font-face\s*\{([^}]*)\}/gi;
@@ -1822,7 +1960,7 @@ async function embedLocalFontFaces(html: string, projectDir: string): Promise<st
         const localPath = urlMatch[1];
         if (!localPath || embeddedPaths.has(localPath)) continue;
         const absPath = localPath.startsWith("/") ? localPath : resolve(projectDir, localPath);
-        if (!isPathInside(absPath, projectDir)) continue;
+        if (!isPathInside(absPath, projectDir) || escapesAssetRoot(absPath, assetRoot)) continue;
         const ext = absPath.match(/\.(woff2?|ttf|otf|ttc)$/i)?.[1]?.toLowerCase() ?? "ttf";
         try {
           if (fileBackedAbsolutePaths.has(absPath)) {
@@ -1834,15 +1972,15 @@ async function embedLocalFontFaces(html: string, projectDir: string): Promise<st
             const font = await readLocalFont(absPath);
             if (font.kind === "file-backed") {
               fileBackedAbsolutePaths.add(absPath);
-              defaultLogger.info(
+              defaultLogger.debug(
                 `[Compiler] Kept large local font file-backed: ${localPath} (> ${(MAX_LOCAL_FONT_DATA_URI_BYTES / 1024 / 1024).toFixed(1)} MB)`,
               );
               embeddedPaths.add(localPath);
               continue;
             }
-            dataUri = await toDataUri(font.buffer, ext);
+            dataUri = await toDataUri(font.buffer, ext, { compressToWoff2: false });
             dataUriByAbsolutePath.set(absPath, dataUri);
-            defaultLogger.info(
+            defaultLogger.debug(
               `[Compiler] Embedded local font file: ${localPath} (${(font.buffer.length / 1024).toFixed(0)} KB → data URI)`,
             );
           }
@@ -1883,6 +2021,8 @@ export interface CompileForRenderOptions {
    * mismatch warning). Optional so non-render callers can omit it.
    */
   log?: ProducerLogger;
+  /** Absolute project paths not on disk, readable at these URLs instead. */
+  urlByAbsentLocalPath?: ReadonlyMap<string, string>;
   /**
    * Threaded through to {@link injectDeterministicFontFaces}. When `true`,
    * deterministic font resolution and exhausted transient fetch failures
@@ -1901,10 +2041,7 @@ export interface CompileForRenderOptions {
   allowSystemFontCapture?: boolean;
   /** Caller cancellation propagated through compile-time font fetches. */
   abortSignal?: AbortSignal;
-  /**
-   * Optional persistent cache directory for prep-time animated GIF → WebM
-   * transcodes. When omitted, the render's downloadDir is used.
-   */
+  /** Persistent cache directory for the animated GIF and HEIC prep transcodes; defaults to downloadDir. */
   animatedGifCacheDir?: string;
   /** FFmpeg timeout for animated GIF transcodes. */
   ffmpegProcessTimeout?: number;
@@ -1915,21 +2052,42 @@ export interface CompileForRenderOptions {
    * `window.__hfVariables` injection covers script reads, not var() in CSS.
    */
   variables?: Record<string, unknown>;
+  pageMotionBlur?: "off";
+  /** Trusted local renders only (CLI, Studio): import files markup reaches outside projectDir. */
+  allowOutsideProjectAssets?: boolean;
 }
 
-const GSAP_CDN_BASE = gsapCdnDist();
+/** Renders follow the same `HYPERFRAMES_GSAP_BASE_URL` mirror as Studio preview. */
+function renderGsapDist(): string {
+  try {
+    return gsapCdnDist(undefined, normalizeGsapBaseUrl(process.env.HYPERFRAMES_GSAP_BASE_URL));
+  } catch (cause) {
+    throw new Error(
+      "Invalid HYPERFRAMES_GSAP_BASE_URL: use an absolute HTTPS npm mirror root (plain HTTP only for localhost) without credentials, query, or fragment",
+      { cause },
+    );
+  }
+}
 
-function rewriteUnresolvableGsapToCdn(html: string, projectDir: string): string {
+/** `compSrcPath` resolves a sub-composition's script the way the inliner will hoist it. */
+function rewriteUnresolvableGsapToCdn(
+  html: string,
+  projectDir: string,
+  compSrcPath?: string,
+): string {
+  let gsapDist: string | undefined;
+  const exists = (path: string) => {
+    const file = resolve(projectDir, path);
+    return !namesAnotherNetworkRoot(projectDir, file) && existsSync(file);
+  };
   return html.replace(
     /(<script\b[^>]*\bsrc=["'])([^"']*gsap[^"']*\/dist\/([^"']+))(["'][^>]*>)/gi,
     (full, prefix, src, file, suffix) => {
       if (/^https?:\/\//i.test(src)) return full;
-      const absPath = resolve(projectDir, src);
-      if (existsSync(absPath)) return full;
-      defaultLogger.info(
-        `[Compiler] Rewriting missing gsap script to CDN: ${src} → ${GSAP_CDN_BASE}${file}`,
-      );
-      return `${prefix}${GSAP_CDN_BASE}${file}${suffix}`;
+      if (exists(compSrcPath ? rewriteAssetPath(compSrcPath, src, exists) : src)) return full;
+      gsapDist ??= renderGsapDist();
+      defaultLogger.debug(`[Compiler] Rewriting missing gsap script: ${src} → ${gsapDist}${file}`);
+      return `${prefix}${gsapDist}${file}${suffix}`;
     },
   );
 }
@@ -1947,7 +2105,7 @@ function rebaseDirectEntryAssetPaths(html: string, projectDir: string, htmlPath:
   const { document } = parseHTML(html);
   const assetExists = (path: string) => existsSync(resolve(projectDir, path));
   rewriteAssetPaths(
-    document.querySelectorAll("[src], [href]"),
+    document.querySelectorAll("[src], [href], [srcset]"),
     entryPath,
     (el: Element, attr: string) => el.getAttribute(attr),
     (el: Element, attr: string, value: string) => el.setAttribute(attr, value),
@@ -1967,6 +2125,29 @@ function rebaseDirectEntryAssetPaths(html: string, projectDir: string, htmlPath:
 }
 
 /**
+ * Point each `data-var-src` video/audio at the clip its variable names, so the length and sound read below
+ * are the bound clip's. Media under a per-instance `data-variable-values` host keeps the browser's answer.
+ */
+function bindVariableMediaSources(html: string, variables: Record<string, unknown>): string {
+  if (!html.includes("data-var-src")) return html;
+  const { document } = parseHTML(html);
+  const declared: Record<string, unknown> = {};
+  for (const el of document.querySelectorAll("[data-composition-variables]")) {
+    Object.assign(declared, readDeclaredDefaults(el));
+  }
+  const values = { ...declared, ...variables };
+  let changed = false;
+  for (const el of document.querySelectorAll("video[data-var-src], audio[data-var-src]")) {
+    if (el.closest("[data-variable-values]")) continue;
+    const src = boundMediaSrc(el, values);
+    if (src === null || el.getAttribute("src") === src) continue;
+    el.setAttribute("src", src);
+    changed = true;
+  }
+  return changed ? document.toString() : html;
+}
+
+/**
  * Compile an HTML composition project into a single self-contained HTML string
  * with all media metadata resolved.
  */
@@ -1977,12 +2158,15 @@ export async function compileForRender(
   downloadDir: string,
   options: CompileForRenderOptions = {},
 ): Promise<CompiledComposition> {
-  const entryHtml = rebaseDirectEntryAssetPaths(
-    readFileSync(htmlPath, "utf-8"),
-    projectDir,
-    htmlPath,
+  const assetRoot = options.allowOutsideProjectAssets ? undefined : projectDir;
+  if (isPathInside(htmlPath, projectDir) && escapesAssetRoot(htmlPath, assetRoot)) {
+    throw new Error(`Entry file ${htmlPath} leads outside the project folder`);
+  }
+  const entryHtml = rebaseDirectEntryAssetPaths(readTextFile(htmlPath), projectDir, htmlPath);
+  const rawHtml = bindVariableMediaSources(
+    normalizeCompositionSrcs(rewriteUnresolvableGsapToCdn(entryHtml, projectDir), projectDir),
+    options.variables ?? {},
   );
-  const rawHtml = rewriteUnresolvableGsapToCdn(entryHtml, projectDir);
 
   // Pre-flight: every data-composition-src reference must resolve to a
   // usable file before we spend any time compiling, launching a browser, or
@@ -1990,17 +2174,29 @@ export async function compileForRender(
   // unconditional (not gated behind --strict like lint warnings) — a render
   // that silently drops a scene is strictly worse than one that refuses to
   // start.
-  assertSubCompositionsUsable(rawHtml, projectDir);
+  assertSubCompositionsUsable(rawHtml, projectDir, assetRoot);
 
+  const probes: SourceProbes = new Map();
   const { html: compiledHtml, unresolvedCompositions } = await compileHtmlFile(
     rawHtml,
     projectDir,
     downloadDir,
     options.log,
+    options.urlByAbsentLocalPath,
+    probes,
+    assetRoot,
   );
 
   // Compile each referenced sub-composition so the inliner can hoist it.
-  const { subCompositions } = await parseSubCompositions(compiledHtml, projectDir, downloadDir);
+  const { subCompositions } = await parseSubCompositions(
+    compiledHtml,
+    projectDir,
+    downloadDir,
+    undefined,
+    options.urlByAbsentLocalPath,
+    probes,
+    assetRoot,
+  );
 
   // Ensure the HTML is a full document before inlining sub-compositions.
   // When index.html is a fragment (no <html>/<head>/<body>), linkedom.parseHTML()
@@ -2016,6 +2212,7 @@ export async function compileForRender(
     subCompositions,
     projectDir,
     options.variables ?? {},
+    assetRoot,
   );
 
   // Strip preload="none" from media elements — the renderer needs to load all
@@ -2026,25 +2223,27 @@ export async function compileForRender(
     /(<(?:video|audio)\b[^>]*?)\s+preload\s*=\s*["']none["']/gi,
     "$1",
   );
-  const renderModeHints = detectRenderModeHints(sanitizedHtml);
+  const renderModeHints = detectRenderModeHints(sanitizedHtml, options.pageMotionBlur);
   const hasShaderTransitions = detectShaderTransitionUsage(sanitizedHtml);
   // Detected BEFORE inlineExternalScripts: GSAP's own source contains
   // `transformPerspective`, so scanning post-inline HTML would flag every
   // composition that loads GSAP from a CDN.
   const usesThreeDTransforms = detectThreeDTransformUsage(sanitizedHtml);
-  const usesMixBlendMode = detectMixBlendModeUsage(sanitizedHtml);
   const hasAncestorBackgroundImage = detectAncestorBackgroundImage(sanitizedHtml);
 
+  // Remote font stylesheets join the page first, or the font check below cannot see them.
+  const fontSheetHtml = await inlineExternalFontStylesheets(
+    promoteCssImportsToLinkTags(sanitizedHtml),
+  );
   const normalizedFontHtml = normalizeSystemFontPrimaryFamilies(
-    injectTextRenderingRule(
-      coalesceHeadStylesAndBodyScripts(promoteCssImportsToLinkTags(sanitizedHtml)),
-    ),
+    injectTextRenderingRule(coalesceHeadStylesAndBodyScripts(fontSheetHtml)),
   );
 
   const coalescedHtml = await injectDeterministicFontFaces(normalizedFontHtml, {
     logger: defaultLogger,
     failClosedFontFetch: options.failClosedFontFetch === true,
     allowSystemFontCapture: options.allowSystemFontCapture,
+    projectFontFamilies: projectStylesheetFontFamilies(fontSheetHtml, projectDir),
     abortSignal: options.abortSignal,
   });
 
@@ -2101,30 +2300,51 @@ export async function compileForRender(
   // allow http://localhost:PORT as origin), causing Chrome to silently fall
   // back to the next font in the stack.
   const { html: htmlWithLocalizedFonts, remoteMediaAssets: remoteFontAssets } =
-    await localizeRemoteFontFaces(htmlWithLocalBg, downloadDir);
+    await localizeFontFaceUrls(htmlWithLocalBg, downloadDir);
+
+  // Chrome cannot decode HEIC, and ffprobe reads a tiled one as video streams,
+  // so convert to JPEG before the media-type preflight sees it.
+  const {
+    html: htmlWithJpegs,
+    preparedAssets: preparedHeifAssets,
+    preparedImages: preparedHeifImages,
+  } = await prepareHeifImageInputs(htmlWithLocalizedFonts, {
+    projectDir,
+    downloadDir,
+    cacheDir: options.animatedGifCacheDir,
+    sourceAssets: remoteImageAssets,
+    timeoutMs: options.ffmpegProcessTimeout,
+    assetRoot,
+  });
+  if (preparedHeifImages.length > 0) {
+    defaultLogger.debug(`[Compiler] Converted ${preparedHeifImages.length} HEIC image(s) to JPEG`);
+  }
 
   const gifSourceAssets = new Map<string, string>(remoteImageAssets);
   const {
     html: htmlWithPreparedGifs,
     preparedAssets: preparedGifAssets,
     preparedGifs,
-  } = await prepareAnimatedGifInputs(htmlWithLocalizedFonts, {
+  } = await prepareAnimatedGifInputs(htmlWithJpegs, {
     projectDir,
     downloadDir,
     cacheDir: options.animatedGifCacheDir,
     sourceAssets: gifSourceAssets,
     timeoutMs: options.ffmpegProcessTimeout,
+    assetRoot,
   });
   if (preparedGifs.length > 0) {
-    defaultLogger.info(`[Compiler] Prepared ${preparedGifs.length} animated GIF input(s) as WebM`);
+    defaultLogger.debug(`[Compiler] Prepared ${preparedGifs.length} animated GIF input(s) as WebM`);
   }
 
-  const embeddedHtml = await embedLocalFontFaces(htmlWithPreparedGifs, projectDir);
+  const embeddedHtml = await embedLocalFontFaces(htmlWithPreparedGifs, projectDir, assetRoot);
 
   // Collect assets that resolve outside projectDir (e.g. ../shared-assets/hero.png).
   // These can't be served by the file server, so we map them to paths the
   // orchestrator will copy into the compiled output directory.
-  const { html, externalAssets } = collectExternalAssets(embeddedHtml, projectDir);
+  const { html, externalAssets } = options.allowOutsideProjectAssets
+    ? collectExternalAssets(embeddedHtml, projectDir)
+    : { html: embeddedHtml, externalAssets: new Map<string, string>() };
 
   for (const [relPath, absPath] of remoteMediaAssets) {
     externalAssets.set(relPath, absPath);
@@ -2141,22 +2361,34 @@ export async function compileForRender(
   for (const [relPath, absPath] of preparedGifAssets) {
     externalAssets.set(relPath, absPath);
   }
+  for (const [relPath, absPath] of preparedHeifAssets) {
+    externalAssets.set(relPath, absPath);
+  }
 
   // Read the media list off the inlined document rather than merging the
   // per-file lists. Merging deduplicated by element id, which is only unique
   // within one composition file: two scenes declaring `<video id="clip">` — or
   // two bare `<video>`s, both auto-numbered `hf-video-0` — collapsed into one
   // entry and injected frames onto whichever element came first. See #3340.
-  const { videos, audios, images } = collectRenderMedia(html);
+  const { videos, audios, images, droppedMediaIds, gradedCanvas } = collectRenderMedia(html);
   const masterFxChain = parseMasterFxChain(html);
 
   // Advisory video checks (sparse keyframes, VFR). Fire-and-forget — these spawn
   // ffprobe subprocesses and should not block compilation since they only produce warnings.
   // The two probes run in sequence rather than in parallel: the keyframe analysis needs
   // the video stream's own duration to classify a single-keyframe (single-GOP) file.
+  const advised = new Set<string>();
   for (const video of videos) {
     if (isHttpUrl(video.src)) continue;
     const videoPath = resolve(projectDir, video.src);
+    if (
+      advised.has(videoPath) ||
+      namesAnotherNetworkRoot(projectDir, videoPath) ||
+      !existsSync(videoPath) ||
+      escapesAssetRoot(videoPath, assetRoot)
+    )
+      continue;
+    advised.add(videoPath);
     const reencode = `ffmpeg -i "${video.src}" -c:v libx264 -r 30 -g 30 -keyint_min 30 -movflags +faststart -c:a copy output.mp4`;
     (async () => {
       const metadata = await withMediaProbeSlot(() => extractMediaMetadata(videoPath));
@@ -2166,7 +2398,7 @@ export async function compileForRender(
       if (analysis.isProblematic) {
         defaultLogger.warn(
           `[Compiler] WARNING: Video "${video.id}" has sparse keyframes (max interval: ${analysis.maxIntervalSeconds}s). ` +
-            `This causes seek failures and frame freezing. Re-encode with: ${reencode}`,
+            `Long GOPs can make preview seeking slower; rendering is unaffected. If preview seeking is slow, re-encode with: ${reencode}`,
         );
       }
       if (metadata.isVFR) {
@@ -2201,6 +2433,8 @@ export async function compileForRender(
     videos,
     audios,
     images,
+    droppedMediaIds,
+    gradedCanvas,
     ...(masterFxChain ? { masterFxChain } : {}),
     unresolvedCompositions,
     externalAssets,
@@ -2210,7 +2444,6 @@ export async function compileForRender(
     renderModeHints,
     hasShaderTransitions,
     usesThreeDTransforms,
-    usesMixBlendMode,
     hasAncestorBackgroundImage,
   };
 }
@@ -2233,6 +2466,7 @@ export interface BrowserMediaElement {
   /** True when compilation inferred duration from the fallback source. */
   durationInferred: boolean;
   mediaStart: number;
+  playbackRate: RateSpec;
   loop: boolean;
   hasAudio: boolean;
   volume: number;
@@ -2258,6 +2492,9 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
       durationInferred: boolean;
       playbackStartRaw: string | null;
       mediaStartRaw: string | null;
+      playbackRateRaw: string | null;
+      automationRaw: string | null;
+      defaultPlaybackRate: number;
       loop: boolean;
       hasAudio: boolean;
       volume: number;
@@ -2298,7 +2535,10 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
       if (!id) return;
 
       // currentSrc is authoritative for <video>/<audio><source> and responsive images.
-      const src = htmlEl.currentSrc || htmlEl.src || htmlEl.getAttribute("src") || "";
+      const resolvedSrc = htmlEl.currentSrc || htmlEl.src || htmlEl.getAttribute("src") || "";
+      const withoutQueryAndHash = (url: string) => url.replace(/[?#][\s\S]*$/, "");
+      const isPageItself = withoutQueryAndHash(resolvedSrc) === withoutQueryAndHash(location.href);
+      const src = isPageItself ? "" : resolvedSrc;
       const start = parseFloat(htmlEl.getAttribute("data-start") || "0");
       const endRaw = htmlEl.getAttribute("data-end");
       const durationRaw = htmlEl.getAttribute("data-duration");
@@ -2308,6 +2548,12 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
         : (htmlEl as HTMLVideoElement | HTMLAudioElement).duration;
       const playbackStartRaw = htmlEl.getAttribute("data-playback-start");
       const mediaStartRaw = htmlEl.getAttribute("data-media-start");
+      const playbackRateRaw = htmlEl.getAttribute("data-playback-rate");
+      const automationRaw = htmlEl.getAttribute("data-automation");
+      // playbackRate can include the transport speed; defaultPlaybackRate is the clip's own rate.
+      const defaultPlaybackRate = isImage
+        ? 1
+        : (htmlEl as HTMLVideoElement | HTMLAudioElement).defaultPlaybackRate;
       const loop = htmlEl.hasAttribute("loop");
       const hasAudio = htmlEl.getAttribute("data-has-audio") === "true";
       const volume = parseFloat(htmlEl.getAttribute("data-volume") || "1");
@@ -2326,6 +2572,9 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
         durationInferred,
         playbackStartRaw,
         mediaStartRaw,
+        playbackRateRaw,
+        automationRaw,
+        defaultPlaybackRate,
         loop,
         hasAudio,
         volume,
@@ -2337,7 +2586,17 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
   });
 
   return elements.map(
-    ({ endRaw, durationRaw, intrinsicDuration, playbackStartRaw, mediaStartRaw, ...element }) => ({
+    ({
+      endRaw,
+      durationRaw,
+      intrinsicDuration,
+      playbackStartRaw,
+      mediaStartRaw,
+      playbackRateRaw,
+      automationRaw,
+      defaultPlaybackRate,
+      ...element
+    }) => ({
       ...element,
       end: parseStrictFiniteTimingNumber(endRaw) ?? 0,
       duration:
@@ -2351,6 +2610,13 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
           return null;
         },
       }),
+      playbackRate: resolveRateSpec(
+        automationRaw,
+        readPlaybackRate(
+          (name) => (name === "data-playback-rate" ? playbackRateRaw : null),
+          defaultPlaybackRate,
+        ),
+      ),
     }),
   );
 }
@@ -2723,6 +2989,7 @@ export async function recompileWithResolutions(
   resolutions: ResolvedDuration[],
   projectDir: string,
   downloadDir: string,
+  assetRoot?: string,
 ): Promise<CompiledComposition> {
   if (resolutions.length === 0) return compiled;
 
@@ -2733,7 +3000,15 @@ export async function recompileWithResolutions(
   // `data-end` on its host, and re-collecting would newly clamp clips to it —
   // a retiming, not an identity fix. `compiled.videos` was already collected
   // from this same inlined document, so it is complete and correctly keyed.
-  const { subCompositions } = await parseSubCompositions(html, projectDir, downloadDir);
+  const { subCompositions } = await parseSubCompositions(
+    html,
+    projectDir,
+    downloadDir,
+    undefined,
+    undefined,
+    undefined,
+    assetRoot,
+  );
   const { videos, audios, images } = compiled;
 
   const remaining = compiled.unresolvedCompositions.filter(

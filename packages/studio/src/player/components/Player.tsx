@@ -1,12 +1,14 @@
 import { buildProjectApiPath } from "../../utils/projectRouting";
 import { forwardRef, useEffect, useRef, useState } from "react";
 import { isLottieAnimationLoaded } from "@hyperframes/core/runtime/lottie-readiness";
+import { installAcceleratedCanvasTracker } from "@hyperframes/core/page-motion-blur";
 import { useMountEffect } from "../../hooks/useMountEffect";
 import { applyPreviewVariablesToUrl } from "../../hooks/previewVariablesStore";
 import { HyperframesLoader } from "../../components/ui";
 import { usePlayerStore } from "../store/playerStore";
 import { announcePreviewDocumentLoaded } from "../sceneSwap";
 import type { IframeWindow } from "../lib/playbackTypes";
+import { watchPreviewFrame } from "../lib/bridgePlayback";
 // Importing "@hyperframes/player" registers a class extending HTMLElement at
 // module load, which throws under SSR, hence the dynamic import behind a
 // `typeof window` guard. Kicking it here rather than in the mount effect puts
@@ -25,6 +27,8 @@ export function loadPlayerModule(): Promise<unknown> {
 
 if (typeof window !== "undefined") void loadPlayerModule().catch(() => {});
 
+if (typeof window !== "undefined") installAcceleratedCanvasTracker();
+
 interface PlayerProps {
   projectId?: string;
   directUrl?: string;
@@ -37,6 +41,8 @@ interface PlayerProps {
   portrait?: boolean;
   style?: React.CSSProperties;
   suppressLoadingOverlay?: boolean;
+  loadingUi?: "studio" | "host";
+  noLoadTimeout?: boolean;
 }
 
 interface HyperframesPlayerElement extends HTMLElement {
@@ -86,6 +92,9 @@ function enableInteractiveIframe(player: HyperframesPlayerElement): void {
   container?.style.setProperty("pointer-events", "auto");
   iframe?.style.setProperty("pointer-events", "auto");
 }
+
+const studioDraws = (wait: boolean, loadingUi: PlayerProps["loadingUi"]) =>
+  wait && loadingUi !== "host";
 
 function isPreviewMediaElement(el: Element): el is HTMLMediaElement {
   const tagName = el.tagName.toLowerCase();
@@ -154,6 +163,8 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
       portrait,
       style,
       suppressLoadingOverlay,
+      noLoadTimeout,
+      ...host
     },
     ref,
   ) => {
@@ -224,6 +235,7 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
           setCompositionLoading(true);
           loadStartedAtRef.current = performance.now();
           loadIdRef.current += 1;
+          player.removeAttribute("no-load-timeout");
           player.setAttribute("src", retryUrl.pathname + retryUrl.search);
         };
         retryPreviewRef.current = retryPreview;
@@ -331,6 +343,7 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
         player.setAttribute("shader-capture-scale", "1");
         player.setAttribute("shader-loading", "player");
         player.setAttribute("low-power-idle", "");
+        player.toggleAttribute("no-load-timeout", noLoadTimeout === true);
         player.setAttribute("width", String(portrait ? 1080 : 1920));
         player.setAttribute("height", String(portrait ? 1920 : 1080));
         player.style.width = "100%";
@@ -341,18 +354,7 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
         loadIdRef.current += 1;
         player.setAttribute("src", src);
         container.appendChild(player);
-
-        // Inject pasteboard shadow: let the shadow around the canvas bleed
-        // into the surrounding pasteboard area (overflow: visible on the container)
-        // and add a subtle outline + drop-shadow so the canvas boundary reads
-        // against the gray pasteboard, consistent with professional editors.
-        if (player.shadowRoot) {
-          const pasteboardStyle = document.createElement("style");
-          pasteboardStyle.textContent =
-            ".hfp-container{overflow:visible}" +
-            ".hfp-iframe{box-shadow:0 0 0 1px rgba(255,255,255,0.08),0 4px 32px rgba(0,0,0,.7)}";
-          player.shadowRoot.appendChild(pasteboardStyle);
-        }
+        watchPreviewFrame(iframe);
 
         enableInteractiveIframe(player);
 
@@ -377,11 +379,11 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
           // During crossfade refreshes the retiring Player unmounts after the
           // new Player has already assigned its iframe to the same ref — blindly
           // nulling it would break seeking in the new Player.
-          // Callback refs are skipped — we can't read back the current value to
-          // guard against clobbering a newer assignment. The mutable-ref branch
-          // (the only path used today) is guarded by identity check.
+          // Callback refs are left alone: a shadow reload's promotion repoints
+          // the live frame without calling them, so a null here would wipe it.
+          // Their owners check `isConnected` instead (useShadowPreviewReload).
           if (typeof ref === "function") {
-            // no-op: can't safely guard callback refs
+            // no-op
           } else if (ref) {
             const mutableRef = ref as React.MutableRefObject<HTMLIFrameElement | null>;
             if (mutableRef.current === iframe) {
@@ -478,16 +480,18 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
       return () => clearTimeout(timer);
     }, [projectId]);
 
-    const showCompositionOverlay =
+    const compositionWaitShown =
       !suppressLoadingOverlay &&
       !compositionOverlayDeferred &&
       shouldShowCompositionLoadingOverlay(compositionLoading);
-    const showAssetOverlay =
-      assetOverlayVisible && !shaderTransitionLoading && !showCompositionOverlay && !previewError;
+    const assetWaitShown =
+      assetOverlayVisible && !shaderTransitionLoading && !compositionWaitShown && !previewError;
+    const showCompositionOverlay = studioDraws(compositionWaitShown, host.loadingUi);
+    const showAssetOverlay = studioDraws(assetWaitShown, host.loadingUi);
 
     useEffect(() => {
-      onCompositionLoadingChange?.(showCompositionOverlay || showAssetOverlay);
-    }, [onCompositionLoadingChange, showCompositionOverlay, showAssetOverlay]);
+      onCompositionLoadingChange?.(compositionWaitShown || assetWaitShown);
+    }, [onCompositionLoadingChange, compositionWaitShown, assetWaitShown]);
 
     return (
       <div

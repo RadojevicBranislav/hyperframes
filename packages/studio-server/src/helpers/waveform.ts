@@ -4,13 +4,14 @@ import {
   writeFileSync,
   mkdirSync,
   lstatSync,
-  mkdtempSync,
   renameSync,
   rmSync,
   statSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { findFfBinary } from "@hyperframes/parsers/ff-binaries";
+import { requireFfBinary } from "@hyperframes/parsers/ff-binaries";
+import { probeAudioTrack } from "./mediaMetadata.js";
+import { createStagingDir } from "@hyperframes/core/atomic-file";
 
 const SAMPLE_RATE = 4000;
 const PEAK_COUNT = 4000;
@@ -58,13 +59,18 @@ function computePeaks(floats: Float32Array, count: number): number[] {
   return peaks.map((p) => p / maxPeak);
 }
 
-export function decodeAudioPeaks(audioPath: string): Promise<number[]> {
+export async function decodeAudioPeaks(audioPath: string): Promise<number[]> {
+  const track = await probeAudioTrack(audioPath);
+  if (!track) throw new Error("no audio stream");
+  const ffmpeg = requireFfBinary("ffmpeg");
   return new Promise((resolvePromise, reject) => {
     const proc = spawn(
-      findFfBinary("ffmpeg") ?? "ffmpeg",
+      ffmpeg,
       [
         "-i",
         audioPath,
+        "-map",
+        `0:a:${track.stream}`,
         "-af",
         "atrim=start_sample=1152",
         "-f",
@@ -127,7 +133,7 @@ export function writeWaveformCache(cachePath: string, peaks: number[]): void {
   if (!isWaveformCacheDirectory(cacheDir)) {
     throw new Error("Waveform cache must be a directory, not a symlink");
   }
-  const stagingDir = mkdtempSync(join(cacheDir, ".waveform-"));
+  const stagingDir = createStagingDir(cacheDir, ".waveform-");
   try {
     const stagingPath = join(stagingDir, "peaks.json");
     writeFileSync(stagingPath, JSON.stringify(peaks), { flag: "wx" });

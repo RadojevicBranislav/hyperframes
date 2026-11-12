@@ -1,11 +1,12 @@
 // fallow-ignore-file complexity
-import { defineCommand } from "citty";
-import { execFileSync, execSync } from "node:child_process";
+import { defineCommand } from "../utils/defineCommand.js";
+import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
 import { dirname } from "node:path";
 import { resolveExtractCacheDir } from "@hyperframes/engine";
+import { findTrustedExecutable } from "@hyperframes/parsers/ff-binaries";
 import type { Example } from "./_examples.js";
 import { CONFIG_PATH } from "../telemetry/config.js";
 import { withFileLock } from "../media-use/lib/config-lock.mjs";
@@ -16,6 +17,11 @@ import { KOKORO_MODULES, KOKORO_PIP, MUSICGEN_MODULES, MUSICGEN_PIP } from "../a
 import { hasPythonModules, describeRejectedPythonOverride } from "../tts/python.js";
 import { VERSION } from "../version.js";
 import { getUpdateMeta, withMeta } from "../utils/updateCheck.js";
+import {
+  installChannelLabel,
+  runningInstall,
+  updateCommandFor,
+} from "../utils/installerDetection.js";
 import {
   OPTIONAL_PACKAGES,
   installedOptionalPackageVersion,
@@ -46,6 +52,16 @@ interface CheckResult {
 
 export { parseToolVersion };
 
+export const TESTED_FFMPEG_VERSION = "8.0.1";
+
+export function ffmpegDoctorDetail(detail: string): string {
+  return new RegExp(`^ffmpeg n?${TESTED_FFMPEG_VERSION.replaceAll(".", "\\.")}(?![.\\d])`).test(
+    detail,
+  )
+    ? `${detail} (tested build)`
+    : `${detail}; loudness numbers are only comparable on ${TESTED_FFMPEG_VERSION}`;
+}
+
 function checkDocker(): CheckResult {
   try {
     const version = execSync("docker --version", { encoding: "utf-8", timeout: 5000 }).trim();
@@ -72,16 +88,24 @@ function checkDockerRunning(): CheckResult {
   }
 }
 
-function checkVersion(): CheckResult {
+export function checkVersion(): CheckResult {
   const meta = getUpdateMeta();
   if (meta.updateAvailable && meta.latestVersion) {
     return {
       ok: false,
       detail: `${VERSION} \u2192 ${meta.latestVersion} available`,
-      hint: "Run: hyperframes upgrade",
+      hint: `Run: ${updateCommandFor(runningInstall(), meta.latestVersion)}`,
     };
   }
+  if (!meta.latestVersion) return { ok: true, detail: `${VERSION} (not checked yet)` };
   return { ok: true, detail: `${VERSION} (latest)` };
+}
+
+/** Which binary is running and from where: a global install per manager, project-local, npx or a plugin. */
+export function checkInstall(): CheckResult {
+  const install = runningInstall();
+  const where = install.path ?? "entry path unknown";
+  return { ok: true, detail: `${installChannelLabel(install.channel)} \u00B7 ${where}` };
 }
 
 function checkNode(): CheckResult {
@@ -210,12 +234,7 @@ function sourceLabel(source: "env" | "default"): string {
 }
 
 function commandExists(command: string): boolean {
-  try {
-    execFileSync("which", [command], { stdio: "ignore", timeout: 5000 });
-    return true;
-  } catch {
-    return false;
-  }
+  return findTrustedExecutable(command) !== undefined;
 }
 
 /**
@@ -370,6 +389,7 @@ export default defineCommand({
     const environment = await runEnvironmentChecks({ includeBrowser: true });
     const checks: Check[] = [
       { name: "Version", run: checkVersion },
+      { name: "CLI binary", run: checkInstall },
       { name: "Node.js", run: checkNode },
       { name: "CPU", run: checkCPU },
       { name: "Memory", run: checkMemory },
@@ -406,7 +426,8 @@ export default defineCommand({
       outcomes.push({
         name: result.name,
         ok: result.ok,
-        detail: result.detail,
+        detail:
+          result.name === "FFmpeg" && result.ok ? ffmpegDoctorDetail(result.detail) : result.detail,
         ...(result.hint ? { hint: result.hint } : {}),
       });
     }

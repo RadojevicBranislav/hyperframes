@@ -17,6 +17,7 @@ describe("classifyCaptureFailure", () => {
     ["JavaScript heap out of memory", "memory_exhaustion"],
     ["drawElement self-verify failed", "verification"],
     ["Composition has zero duration. Runtime ready: true", "authoring"],
+    ["[FrameCapture] Composition setup did not finish within 45000ms.", "transient_browser"],
     ["Protocol error (Page.captureScreenshot): Unable to capture screenshot", "transient_browser"],
     [
       "[Parallel] Capture failed: Worker 0: Protocol error (Page.captureScreenshot): Unable to capture screenshot",
@@ -100,5 +101,24 @@ describe("classifyCaptureFailure", () => {
         new CaptureFailure({ kind: "protocol_timeout", message: "protocol timeout" }),
       ),
     ).toBe(false);
+  });
+});
+
+describe("classifyCaptureFailure page errors", () => {
+  it("carries the page's error lines onto the classified failure", () => {
+    const failure = classifyCaptureFailure(new Error("Target closed"), {
+      pageErrorLines: ["[Browser:PAGEERROR] script threw"],
+    });
+    expect(failure.pageErrorLines).toEqual(["[Browser:PAGEERROR] script threw"]);
+  });
+
+  it("keeps the lines when an existing failure is reclassified", () => {
+    const original = new CaptureFailure({
+      kind: "transient_browser",
+      message: "Target closed",
+      pageErrorLines: ["[Browser:PAGEERROR] script threw"],
+    });
+    const failure = classifyCaptureFailure(original, { workerDiagnostics: [] });
+    expect(failure.pageErrorLines).toEqual(["[Browser:PAGEERROR] script threw"]);
   });
 });

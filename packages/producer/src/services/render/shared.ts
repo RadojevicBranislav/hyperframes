@@ -25,12 +25,13 @@ import {
   checkOutputResolutionCompatibility,
   type CanvasResolution,
 } from "@hyperframes/core";
-import type {
-  AudioElement,
-  ExtractedFrames,
-  ImageElement,
-  ParallelProgress,
-  VideoElement,
+import {
+  mediaIdPathSegment,
+  type AudioElement,
+  type ExtractedFrames,
+  type ImageElement,
+  type ParallelProgress,
+  type VideoElement,
 } from "@hyperframes/engine";
 import type { CompiledComposition } from "../htmlCompiler.js";
 import { defaultLogger, type ProducerLogger } from "../../logger.js";
@@ -47,6 +48,7 @@ export interface CompositionMetadata {
   videos: VideoElement[];
   audios: AudioElement[];
   images: ImageElement[];
+  gradedCanvas?: boolean;
   masterFxChain?: string;
   width: number;
   height: number;
@@ -105,18 +107,16 @@ export function projectBrowserEndToCompositionTimeline(
  * `deviceScaleFactor`. The composition's intrinsic dimensions stay the
  * page-layout viewport; the screenshot lands at output dims via DPR.
  *
- * The scale must be a positive integer ≥ 1 — fractional DPRs introduce
+ * Upsampling must be by a whole number — fractional DPRs above 1 introduce
  * visible aliasing and we'd rather fail loudly than produce a blurry
- * 4K render. Downsampling (output < composition) is rejected because
- * the user is unlikely to have intended it; if the use case appears
- * we can plumb a separate flag.
+ * 4K render. A smaller preset (720p, 480p) takes a DPR under 1, so Chrome
+ * rasterizes straight at the smaller size.
  *
  * Throws on:
  *   - HDR + outputResolution (HDR compositor processes raw pixel buffers
  *     at composition dimensions and would need parallel scaling).
  *   - Aspect-ratio mismatch (e.g. landscape composition → portrait-4k).
- *   - Non-integer scale ratio.
- *   - Downsampling (output dimensions smaller than composition).
+ *   - Non-integer upsampling ratio.
  */
 export function resolveDeviceScaleFactor(input: {
   compositionWidth: number;
@@ -140,8 +140,9 @@ export function resolveDeviceScaleFactor(input: {
   if (!compat.ok) throw new Error(compat.message);
 
   const target = CANVAS_DIMENSIONS[input.outputResolution];
-  // Aspect ratios match → widthRatio === heightRatio. Compute once.
-  return target.width / input.compositionWidth;
+  // The two ratios match, except a smaller preset's long side rounded to an even pixel (854×480): the long side's, so
+  // Chrome draws all 854 and the short side's 480.375 rounds to 480.
+  return Math.max(target.width / input.compositionWidth, target.height / input.compositionHeight);
 }
 
 /**
@@ -162,6 +163,10 @@ export function writeCompiledArtifacts(
 
   for (const [srcPath, html] of compiled.subCompositions) {
     const outPath = join(compileDir, srcPath);
+    if (!isPathInside(outPath, compileDir)) {
+      console.warn(`[Render] Skipping sub-composition with unsafe path: ${srcPath}`);
+      continue;
+    }
     mkdirSync(dirname(outPath), { recursive: true });
     writeFileSync(outPath, html, "utf-8");
   }
@@ -320,6 +325,29 @@ export function reportFrameProgress(
   });
 }
 
+const lastExtractReportAt = new WeakMap<RenderJob, number>();
+
+/** Frames ffmpeg has written for the source videos, 10% to 20%. */
+export function reportExtractProgress(
+  job: RenderJob,
+  done: number,
+  total: number,
+  onProgress: ProgressCallback | undefined,
+): void {
+  if (total <= 0) return;
+  const frames = Math.min(done, total);
+  reportThrottled(
+    lastExtractReportAt,
+    job,
+    "Extracting video frames",
+    10 + (10 * frames) / total,
+    onProgress,
+    frames === total,
+    { code: "extract_video", done: frames, total },
+    "preprocessing",
+  );
+}
+
 const lastEncodeReportAt = new WeakMap<RenderJob, number>();
 
 /** Frames ffmpeg has encoded, from where capture left the bar up to 90%; same cadence as capture. */
@@ -367,7 +395,28 @@ export function reportAssembleProgress(
   );
 }
 
-const workerPhasesByJob = new WeakMap<RenderJob, Map<number, string>>();
+const workerPhasesByJob = new WeakMap<object, Map<number, string>>();
+
+export function forgetWorkerPhases(job: object): void {
+  workerPhasesByJob.delete(job);
+}
+
+const staticDedupActivityByJob = new WeakMap<object, number>();
+
+/** Counts a render's still-frame check screenshots; the capture stall watcher reads it as activity. */
+export function noteStaticDedupActivity(job: object): void {
+  staticDedupActivityByJob.set(job, (staticDedupActivityByJob.get(job) ?? 0) + 1);
+}
+
+export function staticDedupActivity(job: object): number {
+  return staticDedupActivityByJob.get(job) ?? 0;
+}
+
+export function describeWorkerPhases(job: object): string | undefined {
+  const phases = workerPhasesByJob.get(job);
+  if (!phases?.size) return undefined;
+  return `Last phase per worker: ${[...phases].map(([id, phase]) => `worker ${id} ${phase}`).join(", ")}.`;
+}
 
 /** Browser warm-up before the first frame, from the parallel workers' phase events. */
 export function reportWorkerStartup(
@@ -548,6 +597,11 @@ export function createMemorySampler(intervalMs: number = 250): MemorySampler {
 // One-time guard for the symlink→copy fallback notice below.
 let warnedSymlinkFallback = false;
 
+const copyCannotFix = (error: unknown): boolean =>
+  ["ENOSPC", "EDQUOT", "EEXIST", "ENOENT"].includes(
+    (error as NodeJS.ErrnoException | undefined)?.code ?? "",
+  );
+
 // Junctions avoid Windows symlink privileges. POSIX keeps its copy fallback.
 function tryWindowsFrameJunction(
   fileSystem: MaterializeFileSystem,
@@ -559,30 +613,20 @@ function tryWindowsFrameJunction(
     fileSystem.symlinkSync(src, dest, "junction");
     return true;
   } catch (error) {
-    const code =
-      error instanceof Error && "code" in error && typeof error.code === "string"
-        ? error.code
-        : undefined;
-    if (
-      ["EPERM", "EACCES", "UNKNOWN", "EINVAL", "ENOSYS", "EOPNOTSUPP", "ENOTSUP"].includes(
-        code ?? "",
-      )
-    ) {
-      return false;
-    }
-    throw error;
+    if (copyCannotFix(error)) throw error;
+    return false;
   }
 }
 
-// Create the symlink, degrading to a copy on Windows' no-symlink-privilege
-// errors (EPERM/EACCES, plus UNKNOWN), trying a Windows junction first.
-// Other symlink errors and non-capability junction errors propagate.
+// Create the symlink; a drive that refuses it, with any code, gets a Windows junction, then a copy.
+// A full disk, a missing source or an entry already at dest (stageExtractedFrameDir clears a stale one)
+// propagate: copying would not fix them.
 function linkOrCopyFrameDir(fileSystem: MaterializeFileSystem, src: string, dest: string): void {
   try {
     fileSystem.symlinkSync(src, dest, "dir");
   } catch (err) {
+    if (copyCannotFix(err)) throw err;
     const code = (err as NodeJS.ErrnoException | undefined)?.code;
-    if (code !== "EPERM" && code !== "EACCES" && code !== "UNKNOWN") throw err;
     if (tryWindowsFrameJunction(fileSystem, src, dest)) return;
     // Copying is measurably slower than symlinking, so surface the degrade once
     // — it explains a render that suddenly got heavier and saves a support
@@ -649,7 +693,7 @@ export function materializeExtractedFramesForCompiledDir(
     const resolvedOut = pathModule.resolve(ext.outputDir);
     if (isPathInside(resolvedOut, resolvedCompiledDir, { pathModule })) continue;
 
-    const linkPath = pathModule.join(compiledFrameRoot, ext.videoId);
+    const linkPath = pathModule.join(compiledFrameRoot, mediaIdPathSegment(ext.videoId));
     if (!fileSystem.existsSync(linkPath)) {
       fileSystem.mkdirSync(pathModule.dirname(linkPath), { recursive: true });
       stageExtractedFrameDir(

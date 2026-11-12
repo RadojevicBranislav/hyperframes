@@ -19,8 +19,10 @@ import {
   type DomEditSelection,
 } from "../components/editor/domEditing";
 import { reapplyPositionEditsAfterSeek } from "../components/editor/manualEdits";
+import { holdScenesOf } from "../utils/sceneHold";
 import { useStudioTestHooks } from "./useStudioTestHooks";
 import { logSelect } from "../utils/selectDebug";
+import type { MarqueeSelectionMode } from "../utils/marqueeGeometry";
 import { announceTimelineSelection as announceSelectionToTimeline } from "./domSelectionTimelineMirror";
 import type {
   ApplyDomSelectionOptions,
@@ -308,6 +310,8 @@ export function useDomSelection({
       }
       if (!doc) return null;
 
+      const held = holdScenesOf(iframe, element);
+      if (held) await held;
       reapplyPositionEditsAfterSeek(doc);
 
       const targetElement = findElementForTimelineElement(doc, element, {
@@ -328,6 +332,7 @@ export function useDomSelection({
     async (element: TimelineElement | null) => {
       const seq = ++timelineSelectSeqRef.current;
       if (!element) {
+        void holdScenesOf(previewIframeRef.current, null);
         applyDomSelection(null, { revealPanel: false });
         return;
       }
@@ -344,7 +349,7 @@ export function useDomSelection({
       // and Delete acts on the canvas first — so it removed that, not the clip.
       applyDomSelection(null, { revealPanel: false, announce: false });
     },
-    [applyDomSelection, buildDomSelectionForTimelineElement],
+    [applyDomSelection, buildDomSelectionForTimelineElement, previewIframeRef],
   );
 
   // Forward handle to the group refresher defined below: the single-selection
@@ -356,8 +361,10 @@ export function useDomSelection({
 
   const refreshDomEditSelectionFromPreview = useCallback(
     // fallow-ignore-next-line complexity
-    async (selection: DomEditSelection) => {
-      const iframe = previewIframeRef.current;
+    async (selection: DomEditSelection, iframe = previewIframeRef.current) => {
+      const stillSelected = () =>
+        domEditSelectionsTargetSame(domEditSelectionRef.current, selection);
+      if (!stillSelected()) return;
       let doc: Document | null = null;
       try {
         doc = iframe?.contentDocument ?? null;
@@ -384,7 +391,7 @@ export function useDomSelection({
       }
 
       const nextSelection = await buildDomSelectionFromTarget(element, { previous: selection });
-      if (nextSelection) {
+      if (nextSelection && stillSelected()) {
         applyDomSelection(nextSelection, {
           revealPanel: false,
           preserveGroup: true,
@@ -484,30 +491,41 @@ export function useDomSelection({
 
   const applyMarqueeSelection = useCallback(
     // fallow-ignore-next-line complexity
-    (selections: DomEditSelection[], additive: boolean) => {
-      logSelect("marquee", { hits: selections.length, additive });
+    (selections: DomEditSelection[], mode: MarqueeSelectionMode) => {
+      logSelect("marquee", { hits: selections.length, mode });
       const current = domEditSelectionRef.current;
       const currentGroup = domEditGroupSelectionsRef.current;
+      const previous = seedDomEditGroupWithSelection(currentGroup, current);
+      const replace = mode === "replace";
       if (selections.length === 0) {
-        const count = seedDomEditGroupWithSelection(currentGroup, current).length;
-        if (!additive) applyDomSelection(null, { revealPanel: false });
-        return { changed: !additive && count > 0, count: additive ? count : 0 };
+        if (replace) applyDomSelection(null, { revealPanel: false });
+        return { changed: replace && previous.length > 0, count: replace ? 0 : previous.length };
       }
       let nextGroup: DomEditSelection[];
-      if (additive) {
-        nextGroup = seedDomEditGroupWithSelection(currentGroup, current);
+      let nextSelection: DomEditSelection | undefined;
+      if (mode === "add") {
+        nextGroup = previous;
         for (const s of selections) {
           if (!domEditSelectionInGroup(nextGroup, s)) nextGroup = [...nextGroup, s];
         }
+        nextSelection = current ?? selections[0];
+      } else if (mode === "subtract") {
+        nextGroup = previous.filter((entry) => !domEditSelectionInGroup(selections, entry));
+        if (nextGroup.length === 0) {
+          applyDomSelection(null, { revealPanel: false });
+          return { changed: previous.length > 0, count: 0 };
+        }
+        // Subtracting the primary re-anchors on the first survivor.
+        nextSelection =
+          current && domEditSelectionInGroup(nextGroup, current) ? current : nextGroup[0];
       } else {
         // Dedupe by target: select-as-unit collapses marquee'd members to one group.
         nextGroup = [];
         for (const s of selections) {
           if (!domEditSelectionInGroup(nextGroup, s)) nextGroup.push(s);
         }
+        nextSelection = selections[0];
       }
-      const nextSelection = additive && current ? current : selections[0];
-      const previous = seedDomEditGroupWithSelection(currentGroup, current);
       const changed =
         previous.length !== nextGroup.length ||
         nextGroup.some((selection) => !domEditSelectionInGroup(previous, selection)) ||
@@ -547,7 +565,6 @@ export function useDomSelection({
     buildDomSelectionForTimelineElement,
     handleTimelineElementSelect,
     refreshDomEditSelectionFromPreview,
-    refreshDomEditGroupSelectionsFromPreview,
     applyMarqueeSelection,
   };
 }

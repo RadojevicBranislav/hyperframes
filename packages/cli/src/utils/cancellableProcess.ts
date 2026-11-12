@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
+import { killWithThisProcess } from "./childReaper.js";
 import { terminateProcessTree } from "./processTree.js";
 import { renderSetupFailureFrom, renderSetupResultFrom } from "../renderSetupWorkerLifecycle.js";
 
@@ -14,7 +16,9 @@ export interface CancellableProcessOptions {
   maxBufferBytes?: number;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  detached?: boolean;
   onSpawn?: (pid: number) => void;
+  onStdout?: (chunk: string) => void;
 }
 
 class CancellableProcessError extends Error {
@@ -56,6 +60,7 @@ export function runCancellableProcess(
   const signal = options.signal;
   signal?.throwIfAborted();
 
+  const detached = options.detached ?? process.platform !== "win32";
   return new Promise((resolve, reject) => {
     let child: ChildProcess;
     try {
@@ -64,7 +69,7 @@ export function runCancellableProcess(
         env: options.env,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
-        detached: process.platform !== "win32",
+        detached,
       };
       child = spawn(command, [...args], spawnOptions);
     } catch (error) {
@@ -72,9 +77,13 @@ export function runCancellableProcess(
       return;
     }
 
+    const release = child.pid ? killWithThisProcess(child.pid, detached) : undefined;
     if (child.pid) options.onSpawn?.(child.pid);
     let stdout = "";
     let stderr = "";
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    let outputBytes = 0;
     let settled = false;
     let terminationReason: unknown;
     let terminationSignal: NodeJS.Signals | undefined;
@@ -90,13 +99,7 @@ export function runCancellableProcess(
     };
     const finishReject = async (error: unknown): Promise<void> => {
       if (settled) return;
-      if (terminationTask) {
-        try {
-          terminationSignal = await terminationTask;
-        } catch (terminationError) {
-          error = terminationError;
-        }
-      }
+      if (terminationTask) terminationSignal = await terminationTask.catch(() => terminationSignal);
       if (settled) return;
       settled = true;
       cleanup();
@@ -108,36 +111,38 @@ export function runCancellableProcess(
       terminationCode = code;
       terminationSignal = "SIGTERM";
       if (processTreePid) {
-        terminationTask = terminateProcessTree(processTreePid, { child, processGroup: true });
+        terminationTask = terminateProcessTree(processTreePid, { child, processGroup: detached });
         void terminationTask.catch(() => undefined);
       }
     };
     const onAbort = (): void => terminate(signal?.reason ?? new Error("Operation aborted"));
 
     child.stdout?.on("data", (chunk: Buffer | string) => {
-      stdout += chunk.toString();
-      if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxBufferBytes) {
+      const decoded = typeof chunk === "string" ? chunk : stdoutDecoder.write(chunk);
+      stdout += decoded;
+      options.onStdout?.(decoded);
+      outputBytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length;
+      if (outputBytes > maxBufferBytes) {
         terminate(new Error(`Process output exceeded ${maxBufferBytes} bytes`), "ENOBUFS");
       }
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
-      stderr += chunk.toString();
-      if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxBufferBytes) {
+      stderr += typeof chunk === "string" ? chunk : stderrDecoder.write(chunk);
+      outputBytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length;
+      if (outputBytes > maxBufferBytes) {
         terminate(new Error(`Process output exceeded ${maxBufferBytes} bytes`), "ENOBUFS");
       }
     });
     child.once("error", (error) => void finishReject(error));
     // fallow-ignore-next-line complexity
     child.once("close", async (status, closeSignal) => {
+      release?.();
       if (settled) return;
-      if (terminationTask) {
-        try {
-          terminationSignal = await terminationTask;
-        } catch (error) {
-          await finishReject(error);
-          return;
-        }
-      }
+      const trailingStdout = stdoutDecoder.end();
+      stdout += trailingStdout;
+      if (trailingStdout) options.onStdout?.(trailingStdout);
+      stderr += stderrDecoder.end();
+      if (terminationTask) terminationSignal = await terminationTask.catch(() => terminationSignal);
       if (settled) return;
       settled = true;
       cleanup();
@@ -196,8 +201,16 @@ function renderSetupError(error: unknown): unknown {
   return reason ? new Error(reason, { cause: error }) : error;
 }
 
+function tsxLoaderFromCliInstall(): string {
+  try {
+    return import.meta.resolve("tsx");
+  } catch {
+    return "tsx";
+  }
+}
+
 export async function runRenderSetupWorker<T>(
-  mode: "browser" | "lint" | "orphan-cleanup",
+  mode: "browser" | "browser-install" | "lint" | "orphan-cleanup",
   input: unknown,
   options: CancellableProcessOptions,
 ): Promise<T> {
@@ -206,7 +219,8 @@ export async function runRenderSetupWorker<T>(
     sourceMode ? "../renderSetupWorker.ts" : "./renderSetupWorker.js",
     import.meta.url,
   );
-  const execArgv = sourceMode ? ["--import", "tsx"] : [];
+  const execArgv =
+    sourceMode && !process.versions.bun ? ["--import", tsxLoaderFromCliInstall()] : [];
   let result: CancellableProcessResult;
   try {
     result = await runCancellableProcess(

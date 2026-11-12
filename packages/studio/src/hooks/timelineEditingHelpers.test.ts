@@ -10,6 +10,7 @@ import {
   patchIframeDomTiming,
   persistElementAttribute,
   persistTimelineBatchEdit,
+  persistTimelineEdit,
   type PersistTimelineBatchChange,
 } from "./timelineEditingHelpers";
 import type { TimelineElement } from "../player/store/playerStore";
@@ -379,6 +380,23 @@ describe("persistTimelineBatchEdit", () => {
     expect(perMember).toContain('data-duration="9"');
   });
 
+  it("files the move under every clip it moved, by identity and by the name the clip wears", async () => {
+    stubReadFileContent(SOURCE);
+    const recordEdit = vi.fn(async () => {});
+    await persistTimelineBatchEdit({
+      ...batchInput([moveMember("a", 3, 0, 0), moveMember("b", 4, 1, 1)], []),
+      recordEdit,
+    });
+    expect(recordEdit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targets: [
+          { file: "index.html", id: "a", name: "a" },
+          { file: "index.html", id: "b", name: "b" },
+        ],
+      }),
+    );
+  });
+
   it("skips no-op members instead of aborting the batch (track-insert renumber)", async () => {
     // A track-insert renumber can include a member whose attributes already
     // hold the target values — its patch is string-identical. The batch must
@@ -411,6 +429,111 @@ describe("persistTimelineBatchEdit", () => {
     await expect(
       persistTimelineBatchEdit(batchInput([moveMember("ghost", 3, 0, 2)], writes)),
     ).rejects.toThrow("Unable to patch timeline element ghost in index.html");
+    expect(writes).toHaveLength(0);
+  });
+
+  it("names which lookups a missing clip had, never their values", async () => {
+    stubReadFileContent(SOURCE);
+    // As the timeline builds them: a clip with an id also carries `#id` as its selector.
+    const missing = (element: Partial<TimelineElement>) => {
+      const change = moveMember("ghost", 3, 0, 2);
+      change.element = { ...change.element, ...element };
+      return persistTimelineBatchEdit(batchInput([change], []));
+    };
+    await expect(
+      missing({
+        domId: "intro__hf2",
+        hfId: "hf-zz9q",
+        selector: "#intro__hf2",
+        sourceFile: "compositions/intro.html",
+      }),
+    ).rejects.toThrow("(by hf-id, runtime-renamed id; file from the clip)");
+    await expect(missing({ selector: "#ghost" })).rejects.toThrow("(by id; no file on the clip)");
+    await expect(
+      missing({ domId: undefined, selector: ".caption", selectorIndex: 4 }),
+    ).rejects.toThrow("(by class; no file on the clip)");
+    await expect(
+      missing({ domId: undefined, selector: '[data-composition-id="intro__hf2"]' }),
+    ).rejects.toThrow("(by runtime-renamed composition id; no file on the clip)");
+  });
+});
+
+describe("persistTimelineEdit", () => {
+  const SOURCE = `<div id="root"><video id="a" class="clip" data-start="1" data-duration="3"></video></div>`;
+
+  async function runEdit(id: string, start: number) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ content: SOURCE }) })),
+    );
+    const writes: Array<[string, string]> = [];
+    const pending = new Set<string>();
+    const element = el({ id, tag: "video", domId: id, start: 1, duration: 3 });
+    const done = persistTimelineEdit({
+      projectId: "p1",
+      element,
+      activeCompPath: "index.html",
+      label: "Resize timeline clip",
+      buildPatches: (original, target) =>
+        buildTimelineResizeTimingPatch(original, target, element, {
+          start,
+          duration: 3,
+          playbackStart: undefined,
+        }),
+      writeProjectFile: async (path, content) => {
+        writes.push([path, content]);
+      },
+      recordEdit: async () => {},
+      pendingTimelineEditPathRef: { current: pending },
+    });
+    return { done, writes, pending };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("saves nothing and says nothing when the clip already holds the values (a resize that lands where it began)", async () => {
+    // 1.0000001 is a different number from the clip's 1, so the gesture sees a change; the file writes "1" either way.
+    const { done, writes, pending } = await runEdit("a", 1.0000001);
+    await expect(done).resolves.toBeUndefined();
+    expect(writes).toHaveLength(0);
+    expect(pending.size).toBe(0);
+  });
+
+  it("writes a real change and marks its file", async () => {
+    const { done, writes, pending } = await runEdit("a", 2);
+    await done;
+    expect(writes).toHaveLength(1);
+    expect(writes[0]![1]).toContain('data-start="2"');
+    expect([...pending]).toEqual(["index.html"]);
+  });
+
+  it("files the edit under the clip it changed, by identity and by the name the clip wears", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ content: SOURCE }) })),
+    );
+    const recordEdit = vi.fn(async () => {});
+    const element = el({ id: "a", tag: "video", domId: "a", start: 1, duration: 3 });
+    await persistTimelineEdit({
+      projectId: "p1",
+      element,
+      activeCompPath: "index.html",
+      label: "Move timeline clip",
+      buildPatches: (original, target) => buildTimelineMoveTimingPatch(original, target, 2, 3, 0),
+      writeProjectFile: async () => {},
+      recordEdit,
+      pendingTimelineEditPathRef: { current: new Set<string>() },
+    });
+    expect(recordEdit).toHaveBeenCalledWith(
+      expect.objectContaining({ targets: [{ file: "index.html", id: "a", name: "a" }] }),
+    );
+  });
+
+  it("still throws for a clip the file does not hold", async () => {
+    const { done, writes } = await runEdit("ghost", 2);
+    await expect(done).rejects.toThrow("Unable to patch timeline element ghost in index.html");
     expect(writes).toHaveLength(0);
   });
 });

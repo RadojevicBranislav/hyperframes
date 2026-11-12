@@ -29,6 +29,18 @@ const FIXED_INPUT = {
 };
 
 describe("buildDockerRunArgs", () => {
+  it("preserves an explicit page motion blur override inside Docker", () => {
+    const args = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, pageMotionBlur: "off" },
+    });
+    expect(
+      args.slice(args.indexOf("--page-motion-blur"), args.indexOf("--page-motion-blur") + 2),
+    ).toEqual(["--page-motion-blur", "off"]);
+    expect(buildDockerRunArgs({ ...FIXED_INPUT, options: BASE })).not.toContain(
+      "--page-motion-blur",
+    );
+  });
   it("matches snapshot for the default render", () => {
     expect(buildDockerRunArgs({ ...FIXED_INPUT, options: BASE })).toMatchInlineSnapshot(`
       [
@@ -62,6 +74,16 @@ describe("buildDockerRunArgs", () => {
     expect(flags(true)).toEqual(["run", "--rm", "-e", "HYPERFRAMES_STDOUT_IS_TTY=1"]);
     expect(flags(false)).toEqual(["run", "--rm", "--platform", "linux/amd64"]);
     expect(flags(undefined)).toEqual(["run", "--rm", "--platform", "linux/amd64"]);
+  });
+
+  it("forwards --chroma-subsampling only for 4:4:4, keeping the default argv unchanged", () => {
+    const args = (chromaSubsampling?: "420" | "444") =>
+      buildDockerRunArgs({ ...FIXED_INPUT, options: { ...BASE, chromaSubsampling } });
+    const at = args("444").indexOf("--chroma-subsampling");
+    expect(at).toBeGreaterThan(-1);
+    expect(args("444")[at + 1]).toBe("444");
+    expect(args("420")).toEqual(args(undefined));
+    expect(args("420")).not.toContain("--chroma-subsampling");
   });
 
   it("omits --workers when auto sizing should happen inside the container", () => {
@@ -282,6 +304,20 @@ describe("buildDockerRunArgs", () => {
     expect(args[formatIdx + 1]).toBe("gif");
     expect(loopIdx).toBeGreaterThanOrEqual(0);
     expect(args[loopIdx + 1]).toBe("0");
+  });
+
+  it("forwards the delivery options to the container only when set", () => {
+    const args = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, keyframeIntervalSeconds: 2, maxBitrate: "8M", bufferSize: "12M" },
+    });
+    const after = (flag: string) => args[args.indexOf(flag) + 1];
+    expect(after("--keyframe-interval")).toBe("2");
+    expect(after("--max-bitrate")).toBe("8M");
+    expect(after("--buffer-size")).toBe("12M");
+    const plain = buildDockerRunArgs({ ...FIXED_INPUT, options: BASE });
+    expect(plain).not.toContain("--max-bitrate");
+    expect(plain).not.toContain("--keyframe-interval");
   });
 
   it("forwards --video-bitrate to the container when set", () => {

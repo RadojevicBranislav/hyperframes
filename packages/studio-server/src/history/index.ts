@@ -13,8 +13,12 @@ export {
   type HistoryResult,
   type HistoryWindow,
   HistoryClosedError,
+  HistoryRefusedError,
 } from "./projectHistory.js";
+export { reclaimUncopiedBlobs, type ReclaimedHistory } from "./reclaimUncopied.js";
+export { isUncopiedMedia } from "./uncopied.js";
 export { HistoryBusyError } from "./ownerLock.js";
+export { onRestoredInPlace, type InPlaceOutcome } from "./blobStore.js";
 export { HistoryIdError } from "./historyId.js";
 export { historyCache } from "./historyCache.js";
 export {
@@ -26,7 +30,27 @@ export {
 export {
   START as HISTORY_START,
   type HistoryEntry,
+  type HistoryTarget,
   type HistoryEntrySide,
   type HistoryFileChange,
   type HistoryWho,
 } from "./historyLog.js";
+
+export {
+  beginArtifactCapture,
+  forgetRecordedArtifacts,
+  recordArtifact,
+  recordArtifacts,
+  artifactDirectory,
+  finishSnapshotRun,
+  type ArtifactCapture,
+  type ArtifactInput,
+  type ArtifactRecord,
+  type VideoState,
+  recordRenderSuccess,
+  type RenderRecord,
+} from "./videoState.js";
+
+export { registerRenderOutput } from "../helpers/renderOutputs.js";
+
+export { retainSnapshotOutput } from "./snapshotRuns.js";

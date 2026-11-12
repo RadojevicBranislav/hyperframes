@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -19,9 +20,26 @@ import {
   markSeen,
   readAppTurns,
   readSeen,
+  seenPath,
   unseenTurns,
 } from "./appHistory.js";
 import { readRecord, writeRecord } from "./projectRecords.js";
+
+const { afterDirectoryRead } = vi.hoisted(() => ({
+  afterDirectoryRead: vi.fn<(path: unknown) => void>(),
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...original,
+    readdirSync: vi.fn(original.readdirSync).mockImplementation((path, options) => {
+      const entries = original.readdirSync(path, options);
+      afterDirectoryRead(path);
+      return entries;
+    }),
+  };
+});
 
 const history = (dir: string) => join(dir, ".hyperframes", APP_HISTORY);
 
@@ -47,6 +65,21 @@ beforeEach(() => {
 });
 
 describe("app history", () => {
+  it("keeps the seen record under LOCALAPPDATA on Windows", () => {
+    const localAppData = mkdtempSync(join(tmpdir(), "hf-localappdata-"));
+    vi.stubEnv("LOCALAPPDATA", localAppData);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "hf-project-"));
+      handedOverAt(dir, "2026-10-01T00:00:00Z");
+      expect(seenPath(dir).startsWith(join(localAppData, "hyperframes", "catch-up"))).toBe(true);
+      expect(readSeen(dir).at).toBe(Date.parse("2026-10-01T00:00:00Z"));
+    } finally {
+      if (platform) Object.defineProperty(process, "platform", platform);
+    }
+  });
+
   it("reads the turns, skipping lines that are not one", () => {
     const dir = project([
       turn("2026-01-01T10:00:00Z", "bigger title"),
@@ -128,6 +161,33 @@ describe("app history", () => {
     expect(filesChangedSince(dir, 5000)).toEqual(["compositions/a.html"]);
   });
 
+  it("keeps listing changed files when one disappears after the directory read", () => {
+    const dir = project();
+    const removed = join(dir, "removed.html");
+    writeFileSync(removed, "removed");
+    writeFileSync(join(dir, "index.html"), "kept");
+    mkdirSync(join(dir, "compositions"));
+    writeFileSync(join(dir, "compositions", "scene.html"), "kept");
+    afterDirectoryRead.mockImplementationOnce(() => {
+      rmSync(removed);
+    });
+
+    expect(filesChangedSince(dir, 0)).toEqual(["compositions/scene.html", "index.html"]);
+  });
+
+  it("skips a file replaced by a directory after the directory read", () => {
+    const dir = project();
+    const replaced = join(dir, "replaced.html");
+    writeFileSync(replaced, "replaced");
+    writeFileSync(join(dir, "index.html"), "kept");
+    afterDirectoryRead.mockImplementationOnce(() => {
+      rmSync(replaced);
+      mkdirSync(replaced);
+    });
+
+    expect(filesChangedSince(dir, 0)).toEqual(["index.html"]);
+  });
+
   it("names unseen turns at the end of a command run in the project or on it", () => {
     const dir = project([turn("2026-01-01T10:00:00Z", "a"), turn("2026-01-01T11:00:00Z", "b")]);
     expect(appHistoryNotice(dir, []), "never handed over from here").toBeNull();
@@ -173,5 +233,16 @@ describe("addCatchUpNote", () => {
     expect(readFileSync(join(dir, "CLAUDE.md"), "utf8")).toBe("# My notes\n");
     expect(readFileSync(outside, "utf8")).toBe(older);
     addCatchUpNote(mkdtempSync(join(tmpdir(), "hf-note-")));
+  });
+});
+
+describe("app history under HYPERFRAMES_CACHE_DIR", () => {
+  it("keeps the seen record in the cache folder when it is set", () => {
+    const cache = mkdtempSync(join(tmpdir(), "hf-cache-"));
+    vi.stubEnv("HYPERFRAMES_CACHE_DIR", cache);
+    const dir = mkdtempSync(join(tmpdir(), "hf-project-"));
+    handedOverAt(dir, "2026-10-01T00:00:00Z");
+    expect(seenPath(dir).startsWith(join(cache, "catch-up"))).toBe(true);
+    expect(existsSync(seenPath(dir))).toBe(true);
   });
 });

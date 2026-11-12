@@ -68,7 +68,6 @@ export const CatalogDetail = ({
   compositionSrc,
   variables = [],
   title,
-  description,
   meta = {},
   about,
   attribution,
@@ -585,10 +584,6 @@ export const CatalogDetail = ({
     color 100ms ease;
 }
 
-.hf-ve-head-title { margin: 8px 0 28px; }
-.hf-ve-head-title h1 { margin: 0; font-size: 44px; line-height: 1.1; font-weight: 700; letter-spacing: -0.02em; color: var(--ve-fg); }
-.hf-ve-head-title p { margin: 12px 0 0; font-size: 18px; line-height: 1.5; color: var(--ve-muted); max-width: 70ch; }
-@media (max-width: 640px) { .hf-ve-head-title h1 { font-size: 32px; } }
 /* Item page anatomy: bar, stage beside Tune, tabs, tab body. */
 .hf-ve-bar {
   display: flex;
@@ -1715,6 +1710,27 @@ export const CatalogDetail = ({
    */
   const urlKey = `vars-${compositionId}`;
 
+  // >>> preview values
+  /** JSON that is also inert inside an inline `<script>` and a single-quoted attribute. */
+  function scriptJson(value) {
+    return JSON.stringify(value).replace(/[<>&\u2028\u2029]/g, function (c) {
+      return "\\u" + ("000" + c.charCodeAt(0).toString(16)).slice(-4);
+    });
+  }
+
+  /** The entries of a parsed query object that name a declared id and hold a primitive value. */
+  function declaredValues(parsed, ids) {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([id, value]) => {
+        if (!ids.has(id)) return false;
+        if (typeof value === "number") return Number.isFinite(value);
+        return typeof value === "string" || typeof value === "boolean";
+      }),
+    );
+  }
+  // <<< preview values
+
   const readFromUrl = () => {
     if (typeof window === "undefined") return {};
     try {
@@ -1723,11 +1739,8 @@ export const CatalogDetail = ({
       // `URLSearchParams` has already decoded this once. Decoding again turned
       // a path full of percent-escapes into something that no longer parsed,
       // and doubled the length of every link.
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
       // Only ids this item declares; a stale link must not inject stray keys.
-      const declared = new Set(variables.map((v) => v.id));
-      return Object.fromEntries(Object.entries(parsed).filter(([id]) => declared.has(id)));
+      return declaredValues(JSON.parse(raw), new Set(variables.map((v) => v.id)));
     } catch {
       return {};
     }
@@ -1820,12 +1833,13 @@ export const CatalogDetail = ({
       "script>",
     "</head><body><script>",
     "(function(){",
-    `  var PAYLOAD = ${JSON.stringify(previewSrc)};`,
+    `  var PAYLOAD = ${scriptJson(previewSrc)};`,
     // The frame mounts with whatever a shared link asked for, not the bare
     // defaults. Posting the values afterwards is too late for anything the
     // composition reads once at init — a path arrives, the mark is already
     // drawn from the default one, and only a later edit corrects it.
-    `  var INITIAL = ${JSON.stringify({ ...defaults, ...readFromUrl() })};`,
+    `  var INITIAL = ${scriptJson({ ...defaults, ...readFromUrl() })};`,
+    `  var scriptJson = ${scriptJson.toString()};`,
     "  var html = null, player = null, poll = null;",
     // Two ways in, because a composition can be either shape. A top-level one
     // reads overrides off `window.__hfVariables`; one mounted through
@@ -1833,13 +1847,13 @@ export const CatalogDetail = ({
     // which the loader reads before the sub-composition runs — so that has to
     // be in the markup, not assigned afterwards.
     "  function withValues(source, values) {",
-    "    var json = JSON.stringify(values);",
+    "    var json = scriptJson(values);",
     "    var attr = json.replace(/'/g, '&#39;');",
     "    var out = source.replace(/\\sdata-variable-values=(?:\"[^\"]*\"|'[^']*')/gi, '');",
-    "    out = out.replace(/(data-composition-src=)/gi, \"data-variable-values='\" + attr + \"' $1\");",
+    "    out = out.replace(/data-composition-src=/gi, function (m) { return \"data-variable-values='\" + attr + \"' \" + m; });",
     "    var tag = '<' + 'script>window.__hfVariables=' + json + ';<' + '/script>';",
     "    return /<head[^>]*>/i.test(out)",
-    "      ? out.replace(/<head([^>]*)>/i, '<head$1>' + tag)",
+    "      ? out.replace(/<head[^>]*>/i, function (m) { return m + tag; })",
     "      : tag + out;",
     "  }",
     // The composition reads its variables once, at init, so a new value can
@@ -1875,6 +1889,7 @@ export const CatalogDetail = ({
     "    document.body.innerHTML = '<pre style=\"color:#f66;font:12px monospace;padding:12px\">preview unavailable: ' + e + '</pre>';",
     "  });",
     "  addEventListener('message', function (event) {",
+    "    if (event.source !== parent || event.origin !== self.origin) return;",
     "    var values = event.data && event.data.hfVariables;",
     "    if (!values) return;",
     "    mount(values, player.currentTime || 0);",
@@ -2084,13 +2099,6 @@ export const CatalogDetail = ({
   return (
     <div className="hf-ve my-4">
       <style dangerouslySetInnerHTML={{ __html: CSS }} />
-
-      <div className="not-prose">
-        <header className="hf-ve-head-title">
-          <h1>{title}</h1>
-          {description && <p>{description}</p>}
-        </header>
-      </div>
 
       {installSlot && (
         <div className="hf-ve-install">
